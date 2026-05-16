@@ -242,6 +242,19 @@ async def cmd_attach(channel, channel_id, user_id, query: str):
         await channel.send(f"No running Claude matches `{query}`. Try `!cc live`.")
         return
 
+    # Refuse if another channel already drives this PID — two channels writing into the
+    # same terminal would race, double-mirror, and confuse the user.
+    other = next(
+        (cid for cid, p in attached_pids.items() if p == match.pid and cid != channel_id),
+        None,
+    )
+    if other is not None:
+        await channel.send(
+            f"⚠️ PID {match.pid} is already attached in <#{other}>. "
+            f"Use `!cc detach` there first (or just talk to it from that channel)."
+        )
+        return
+
     # Cancel any existing mirror for this channel.
     old = mirror_tasks.pop(channel_id, None)
     if old and not old.done():
@@ -692,11 +705,23 @@ async def on_ready():
     print(f"  default cwd:      {DEFAULT_CWD}")
 
     # Restore persisted per-channel attachments (channels spawned in earlier sessions).
+    # Enforce one-channel-per-PID: keep the first occurrence, clear the rest.
     primary_user = next(iter(ALLOWED_USERS), 0)
+    seen_pids: set = set()
     for ch_id, pid in sessions.all_attached():
         chan = bot.get_channel(ch_id)
         if not chan:
             sessions.set_attached_pid(ch_id, None)
+            continue
+        if pid in seen_pids:
+            sessions.set_attached_pid(ch_id, None)
+            try:
+                await chan.send(
+                    f"⚠️ PID {pid} was attached here AND elsewhere — clearing this one on restart "
+                    f"(one channel per terminal). Re-attach explicitly if you want it here."
+                )
+            except Exception:
+                pass
             continue
         info = find_by_pid(pid)
         if not info:
@@ -707,6 +732,7 @@ async def on_ready():
                 pass
             continue
         attached_pids[ch_id] = pid
+        seen_pids.add(pid)
         ALLOWED_CHANNELS.add(ch_id)
         jsonl = session_jsonl_path(info.cwd, info.session_id)
         if jsonl.is_file():
