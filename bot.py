@@ -350,9 +350,7 @@ async def cmd_spawn(channel, user_id: int, query: str):
 
 
 async def cmd_close(channel, channel_id, user_id):
-    if channel_id not in attached_pids:
-        await channel.send("This channel isn't attached. `close` only works in spawned channels.")
-        return
+    """Detach (if attached) and delete this channel. Works on orphaned channels too."""
     pid = attached_pids.pop(channel_id, None)
     mt = mirror_tasks.pop(channel_id, None)
     if mt and not mt.done():
@@ -360,7 +358,8 @@ async def cmd_close(channel, channel_id, user_id):
     sessions.set_attached_pid(channel_id, None)
     ALLOWED_CHANNELS.discard(channel_id)
     try:
-        await channel.send(f"🔌 Closing (was on PID {pid})…")
+        msg = f"🔌 Closing (was on PID {pid})…" if pid else "🔌 Closing channel…"
+        await channel.send(msg)
         await channel.delete()
     except discord.Forbidden:
         await channel.send("⚠️ Bot needs **Manage Channels** to delete this channel.")
@@ -704,6 +703,11 @@ async def on_ready():
     print(f"  allowed channels: {sorted(ALLOWED_CHANNELS) or '(any)'}")
     print(f"  default cwd:      {DEFAULT_CWD}")
 
+    # Every channel we've ever tracked stays in the allowlist — even orphaned ones —
+    # so the user can always run `!cc close` to clean them up.
+    for row in sessions.conn.execute("SELECT channel_id FROM sessions"):
+        ALLOWED_CHANNELS.add(row[0])
+
     # Restore persisted per-channel attachments (channels spawned in earlier sessions).
     # Enforce one-channel-per-PID: keep the first occurrence, clear the rest.
     primary_user = next(iter(ALLOWED_USERS), 0)
@@ -718,7 +722,8 @@ async def on_ready():
             try:
                 await chan.send(
                     f"⚠️ PID {pid} was attached here AND elsewhere — clearing this one on restart "
-                    f"(one channel per terminal). Re-attach explicitly if you want it here."
+                    f"(one channel per terminal). Run `!cc close` to delete this channel, "
+                    f"or `!cc attach <name>` to grab a different terminal."
                 )
             except Exception:
                 pass
