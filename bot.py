@@ -722,6 +722,56 @@ async def on_ready():
                 print(f"  slash sync failed for {chan.guild.id}: {e}")
 
 
+async def _handle_attachments(message: discord.Message, channel_id: int, user_id: int) -> bool:
+    """When a Discord message has attachments, save them to the attached terminal's cwd
+    and forward a combined prompt (any text + long-paste content + a note about saved files).
+    Returns True if attachments were present (handled or attempted)."""
+    if not message.attachments:
+        return False
+    pid = attached_pids.get(channel_id)
+    if not pid:
+        await message.channel.send("📎 File handling only works in attached channels (`!cc attach <name>` first).")
+        return True
+    info = find_by_pid(pid)
+    if not info:
+        await message.channel.send(f"PID {pid} no longer running.")
+        return True
+
+    long_paste_text = None
+    saved_files: list = []
+
+    for att in message.attachments:
+        # Discord auto-converts >2000-char pastes into a "message.txt" attachment.
+        # Treat that as inline text, not a file save.
+        if att.filename == "message.txt":
+            try:
+                long_paste_text = (await att.read()).decode("utf-8", errors="replace")
+            except Exception as e:
+                await message.channel.send(f"⚠️ Couldn't read long paste: {e}")
+            continue
+        target = Path(info.cwd) / att.filename
+        try:
+            await att.save(target)
+            saved_files.append(att.filename)
+        except Exception as e:
+            await message.channel.send(f"⚠️ Failed to save {att.filename}: {e}")
+
+    parts: list = []
+    if message.content and message.content.strip() and not message.content.startswith(PREFIX):
+        parts.append(message.content.strip())
+    if long_paste_text:
+        parts.append(long_paste_text)
+    if saved_files:
+        file_list = ", ".join(saved_files)
+        await message.channel.send(f"📎 Saved to `{info.cwd}`: {file_list}")
+        parts.append(f"(I just uploaded these files to your working directory: {file_list})")
+
+    combined = "\n\n".join(parts)
+    if combined:
+        await cmd_terminal_send(message.channel, channel_id, user_id, combined)
+    return True
+
+
 async def _safe_react(message: discord.Message, emoji: str):
     try:
         await message.add_reaction(emoji)
@@ -741,6 +791,19 @@ async def on_message(message: discord.Message):
     if message.author == bot.user:
         return
     if message.author.id not in ALLOWED_USERS:
+        return
+
+    # Attachments in an attached channel → save files + forward any text/long-paste.
+    if message.channel.id in attached_pids and message.attachments:
+        await _safe_react(message, "⌛")
+        try:
+            await _handle_attachments(message, message.channel.id, message.author.id)
+        except Exception:
+            await _safe_unreact(message, "⌛")
+            await _safe_react(message, "❌")
+            raise
+        await _safe_unreact(message, "⌛")
+        await _safe_react(message, "✅")
         return
 
     # In an attached channel, bare text (no prefix) goes straight to the terminal.

@@ -164,32 +164,40 @@ def _flush_events(h_in: int, events: list):
 
 
 def _write_text(h_in: int, text: str):
-    # Step 1: type the characters.
-    typing_events = []
+    # Chunk the typing events so we never overflow the console's input buffer
+    # (default ~256 records). For long pastes we flush every CHUNK_CHARS characters
+    # and sleep briefly to let the TUI consume them.
+    CHUNK_CHARS = 80
+
+    pending: list = []
+    chars_in_chunk = 0
     for ch in text:
         if ch == "\n":
-            # Embedded newline mid-text → press Enter inline.
-            typing_events.append(_key_event("\r", True, VK_RETURN))
-            typing_events.append(_key_event("\r", False, VK_RETURN))
-            continue
-        try:
-            vk = user32.VkKeyScanW(ch) & 0xFF if ch.isprintable() else 0
-        except Exception:
-            vk = 0
-        typing_events.append(_key_event(ch, True, vk))
-        typing_events.append(_key_event(ch, False, vk))
-    _flush_events(h_in, typing_events)
+            pending.append(_key_event("\r", True, VK_RETURN))
+            pending.append(_key_event("\r", False, VK_RETURN))
+            chars_in_chunk += 1
+        else:
+            try:
+                vk = user32.VkKeyScanW(ch) & 0xFF if ch.isprintable() else 0
+            except Exception:
+                vk = 0
+            pending.append(_key_event(ch, True, vk))
+            pending.append(_key_event(ch, False, vk))
+            chars_in_chunk += 1
+        if chars_in_chunk >= CHUNK_CHARS:
+            _flush_events(h_in, pending)
+            pending = []
+            chars_in_chunk = 0
+            time.sleep(0.05)
+    if pending:
+        _flush_events(h_in, pending)
 
-    # Step 2: brief pause so the TUI can process the typed characters before submit.
-    # Without this, some interactive prompts batch-discard the trailing Enter.
+    # Brief pause so the TUI can process the typed characters before the submit Enter.
     time.sleep(0.15)
-
-    # Step 3: a clear submit Enter (separate WriteConsoleInput call).
-    enter_events = [
+    _flush_events(h_in, [
         _key_event("\r", True, VK_RETURN),
         _key_event("\r", False, VK_RETURN),
-    ]
-    _flush_events(h_in, enter_events)
+    ])
 
 
 def main():
