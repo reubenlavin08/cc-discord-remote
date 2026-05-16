@@ -1,9 +1,17 @@
 import asyncio
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Dict, Optional
+
+# Force stdout to UTF-8 so emoji / arrows in print() don't blow up on Windows cp1252.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 # Ping the user with @mention if a turn takes longer than this. Quick replies stay quiet.
 PING_AFTER_SECONDS = 15
@@ -706,7 +714,7 @@ async def on_ready():
             mirror_tasks[ch_id] = asyncio.create_task(
                 _mirror_loop(chan, ch_id, primary_user, jsonl, jsonl.stat().st_size, label)
             )
-            print(f"  restored attachment: channel {ch_id} → PID {pid} ({label})")
+            print(f"  restored attachment: channel {ch_id} -> PID {pid} ({label})")
 
     # Sync slash commands to each guild the allowed channels live in (instant per-guild).
     synced_guilds = set()
