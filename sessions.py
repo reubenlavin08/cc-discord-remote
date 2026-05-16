@@ -24,6 +24,10 @@ class SessionStore:
             );
             """
         )
+        # Add attached_pid column if it doesn't exist (idempotent migration).
+        cols = {row[1] for row in self.conn.execute("PRAGMA table_info(sessions)")}
+        if "attached_pid" not in cols:
+            self.conn.execute("ALTER TABLE sessions ADD COLUMN attached_pid INTEGER")
         self.conn.commit()
 
     # ---- session state ---------------------------------------------------
@@ -60,6 +64,38 @@ class SessionStore:
             (channel_id, session_id, cwd),
         )
         self.conn.commit()
+
+    # ---- per-channel terminal attachment (persistent across bot restarts) ----
+
+    def set_attached_pid(self, channel_id: int, pid: Optional[int]) -> None:
+        existing = self.conn.execute(
+            "SELECT 1 FROM sessions WHERE channel_id = ?", (channel_id,)
+        ).fetchone()
+        if existing:
+            self.conn.execute(
+                "UPDATE sessions SET attached_pid = ? WHERE channel_id = ?",
+                (pid, channel_id),
+            )
+        else:
+            self.conn.execute(
+                "INSERT INTO sessions (channel_id, attached_pid, cwd) VALUES (?, ?, ?)",
+                (channel_id, pid, self.default_cwd),
+            )
+        self.conn.commit()
+
+    def get_attached_pid(self, channel_id: int) -> Optional[int]:
+        row = self.conn.execute(
+            "SELECT attached_pid FROM sessions WHERE channel_id = ?", (channel_id,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def all_attached(self) -> list:
+        return [
+            (r[0], r[1])
+            for r in self.conn.execute(
+                "SELECT channel_id, attached_pid FROM sessions WHERE attached_pid IS NOT NULL"
+            ).fetchall()
+        ]
 
     def reset(self, channel_id: int) -> None:
         _, cwd = self.get(channel_id)

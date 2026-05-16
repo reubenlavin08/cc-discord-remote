@@ -34,22 +34,19 @@ PREFIX = "!cc"
 MAX_CHUNK = 1900
 
 HELP_TEXT = (
-    f"**Claude Code remote**\n"
-    f"Use `{PREFIX} <thing>` or `/cc input:<thing>`.\n\n"
-    f"**Live-attach mode** — drive your *actual* terminal Claude:\n"
-    f"`live` — list running Claude Code processes (with PIDs)\n"
-    f"`attach <pid>` — drive that terminal from this channel\n"
-    f"`detach` — stop driving the terminal\n"
-    f"`look` — snapshot the terminal screen (when attached)\n\n"
+    f"**Claude Code remote**\n\n"
+    f"**Multi-channel** — one Discord channel per terminal:\n"
+    f"`{PREFIX} spawn <name>` — make a new channel auto-attached to that terminal\n"
+    f"`{PREFIX} close` — detach + delete this channel (only in spawned ones)\n\n"
+    f"**Per-channel attach** (manual):\n"
+    f"`{PREFIX} live` — list running Claude Code processes\n"
+    f"`{PREFIX} attach <name>` — drive that terminal from this channel\n"
+    f"`{PREFIX} detach` — stop driving the terminal\n"
+    f"`{PREFIX} look` — snapshot the terminal screen\n\n"
+    f"**In an attached channel**, you can just type messages without `{PREFIX}` — they go straight to the terminal.\n\n"
     f"**SDK mode** (separate Claude process):\n"
-    f"`<prompt>` — drive Claude in this channel's session\n"
-    f"`new` — reset session\n"
-    f"`cancel` — interrupt current turn\n"
-    f"`cd <path>` — switch working directory\n"
-    f"`sessions` — list session files\n"
-    f"`resume <id>` — attach to a stored session\n"
-    f"`status` — show current cwd + session id\n"
-    f"`help` — this message"
+    f"`{PREFIX} <prompt>` — drive Claude in a non-attached channel\n"
+    f"`{PREFIX} new` · `{PREFIX} cancel` · `{PREFIX} cd <path>` · `{PREFIX} sessions` · `{PREFIX} resume <id>` · `{PREFIX} status`"
 )
 
 intents = discord.Intents.default()
@@ -243,6 +240,7 @@ async def cmd_attach(channel, channel_id, user_id, query: str):
         old.cancel()
 
     attached_pids[channel_id] = match.pid
+    sessions.set_attached_pid(channel_id, match.pid)
     label = match.name or match.session_id[:8]
 
     # Start the bidirectional mirror: anything Claude writes to this session's JSONL —
@@ -269,10 +267,84 @@ async def cmd_detach(channel, channel_id):
     mt = mirror_tasks.pop(channel_id, None)
     if mt and not mt.done():
         mt.cancel()
+    sessions.set_attached_pid(channel_id, None)
     if pid is None:
         await channel.send("Not attached to anything.")
         return
     await channel.send(f"🔌 Detached from PID {pid}. Mirror stopped.")
+
+
+def _sanitize_channel_name(raw: str) -> str:
+    out = "".join(c if c.isalnum() or c in "-_" else "-" for c in (raw or "").lower())
+    out = out.strip("-")[:90]
+    return out or "claude-attached"
+
+
+async def cmd_spawn(channel, user_id: int, query: str):
+    """Create a new Discord text channel auto-attached to the matched terminal."""
+    if not query:
+        await channel.send(f"Usage: `{PREFIX} spawn <name>` (matches a running Claude by name or PID)")
+        return
+    if not channel.guild:
+        await channel.send("Can only spawn channels inside a server.")
+        return
+
+    procs = list_running()
+    match = None
+    if query.isdigit():
+        match = next((c for c in procs if c.pid == int(query)), None)
+    if match is None:
+        q_lc = query.lower()
+        name_hits = [c for c in procs if c.name and q_lc in c.name.lower()]
+        id_hits = [c for c in procs if c.session_id.lower().startswith(q_lc)]
+        hits = name_hits or id_hits
+        if len(hits) > 1:
+            labels = ", ".join(f"`{h.name or h.session_id[:8]}`" for h in hits)
+            await channel.send(f"`{query}` is ambiguous: {labels}.")
+            return
+        match = hits[0] if hits else None
+    if match is None:
+        await channel.send(f"No running Claude matches `{query}`.")
+        return
+
+    channel_name = _sanitize_channel_name(match.name or match.session_id[:8])
+    try:
+        new_chan = await channel.guild.create_text_channel(name=channel_name)
+    except discord.Forbidden:
+        await channel.send(
+            "⚠️ Bot needs **Manage Channels** permission. Re-authorize with:\n"
+            "`https://discord.com/oauth2/authorize?client_id=1505073874885152768&permissions=83984&scope=bot`"
+        )
+        return
+    except discord.HTTPException as e:
+        await channel.send(f"⚠️ Couldn't create channel: {e}")
+        return
+
+    # Add to in-memory allowlist so messages there are accepted.
+    ALLOWED_CHANNELS.add(new_chan.id)
+
+    # Attach the new channel to the terminal.
+    await cmd_attach(new_chan, new_chan.id, user_id, str(match.pid))
+    await channel.send(f"📡 Spawned <#{new_chan.id}> attached to `{channel_name}` (PID {match.pid}).")
+
+
+async def cmd_close(channel, channel_id, user_id):
+    if channel_id not in attached_pids:
+        await channel.send("This channel isn't attached. `close` only works in spawned channels.")
+        return
+    pid = attached_pids.pop(channel_id, None)
+    mt = mirror_tasks.pop(channel_id, None)
+    if mt and not mt.done():
+        mt.cancel()
+    sessions.set_attached_pid(channel_id, None)
+    ALLOWED_CHANNELS.discard(channel_id)
+    try:
+        await channel.send(f"🔌 Closing (was on PID {pid})…")
+        await channel.delete()
+    except discord.Forbidden:
+        await channel.send("⚠️ Bot needs **Manage Channels** to delete this channel.")
+    except discord.HTTPException as e:
+        await channel.send(f"⚠️ Couldn't delete channel: {e}")
 
 
 async def _run_console_helper(pid: int, prompt: str, mode: str) -> str:
@@ -574,6 +646,12 @@ async def dispatch(channel, channel_id: int, user_id: int, text: str):
     if rest == "look":
         await cmd_look(channel, channel_id)
         return
+    if rest.startswith("spawn "):
+        await cmd_spawn(channel, user_id, rest[6:].strip())
+        return
+    if rest == "close":
+        await cmd_close(channel, channel_id, user_id)
+        return
     if rest.startswith("cd "):
         await cmd_cd(channel, channel_id, user_id, rest[3:].strip().strip('"').strip("'"))
         return
@@ -604,13 +682,38 @@ async def on_ready():
     print(f"  allowed users:    {sorted(ALLOWED_USERS) or '(none — bot will reject everyone)'}")
     print(f"  allowed channels: {sorted(ALLOWED_CHANNELS) or '(any)'}")
     print(f"  default cwd:      {DEFAULT_CWD}")
+
+    # Restore persisted per-channel attachments (channels spawned in earlier sessions).
+    primary_user = next(iter(ALLOWED_USERS), 0)
+    for ch_id, pid in sessions.all_attached():
+        chan = bot.get_channel(ch_id)
+        if not chan:
+            sessions.set_attached_pid(ch_id, None)
+            continue
+        info = find_by_pid(pid)
+        if not info:
+            sessions.set_attached_pid(ch_id, None)
+            try:
+                await chan.send(f"⚠️ PID {pid} no longer running — attachment cleared on restart.")
+            except Exception:
+                pass
+            continue
+        attached_pids[ch_id] = pid
+        ALLOWED_CHANNELS.add(ch_id)
+        jsonl = session_jsonl_path(info.cwd, info.session_id)
+        if jsonl.is_file():
+            label = info.name or info.session_id[:8]
+            mirror_tasks[ch_id] = asyncio.create_task(
+                _mirror_loop(chan, ch_id, primary_user, jsonl, jsonl.stat().st_size, label)
+            )
+            print(f"  restored attachment: channel {ch_id} → PID {pid} ({label})")
+
     # Sync slash commands to each guild the allowed channels live in (instant per-guild).
     synced_guilds = set()
     for chan_id in ALLOWED_CHANNELS:
         chan = bot.get_channel(chan_id)
         if chan and getattr(chan, "guild", None) and chan.guild.id not in synced_guilds:
             try:
-                # Copy globally-registered commands to this guild for instant availability.
                 tree.copy_global_to(guild=chan.guild)
                 cmds = await tree.sync(guild=chan.guild)
                 print(f"  synced {len(cmds)} slash commands to guild {chan.guild.name}")
@@ -637,13 +740,30 @@ async def _safe_unreact(message: discord.Message, emoji: str):
 async def on_message(message: discord.Message):
     if message.author == bot.user:
         return
+    if message.author.id not in ALLOWED_USERS:
+        return
+
+    # In an attached channel, bare text (no prefix) goes straight to the terminal.
+    if message.channel.id in attached_pids and not message.content.startswith(PREFIX):
+        if not message.content.strip():
+            return
+        await _safe_react(message, "⌛")
+        try:
+            await cmd_terminal_send(message.channel, message.channel.id, message.author.id, message.content)
+        except Exception:
+            await _safe_unreact(message, "⌛")
+            await _safe_react(message, "❌")
+            raise
+        await _safe_unreact(message, "⌛")
+        await _safe_react(message, "✅")
+        return
+
     if not message.content.startswith(PREFIX):
         return
-    if not _is_authorised(message.author.id, message.channel.id):
+    if ALLOWED_CHANNELS and message.channel.id not in ALLOWED_CHANNELS:
         return
-    rest = message.content[len(PREFIX):].strip()
 
-    # Immediate acknowledgement so the user knows the message was received.
+    rest = message.content[len(PREFIX):].strip()
     await _safe_react(message, "⌛")
     try:
         await dispatch(message.channel, message.channel.id, message.author.id, rest)
