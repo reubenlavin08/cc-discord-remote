@@ -1,0 +1,19 @@
+name: Build
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  syntax-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: python -m pip install -r requirements.txt
+      - name: Compile-check every module
+        run: |
+          python -m py_compile bot.py runner.py sessions.py approvals.py session_files.py session_tail.py live_processes.py console_helper.py test_all.py

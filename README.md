@@ -1,6 +1,10 @@
 # cc-discord-remote
 
-Drive [Claude Code](https://claude.com/claude-code) running in a terminal on your laptop from a Discord channel on your phone. Both real live-attach to an existing terminal session **and** a headless fallback using the Agent SDK.
+![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)
+![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)
+[![Build](https://github.com/reubenlavin08/cc-discord-remote/actions/workflows/ci.yml/badge.svg)](https://github.com/reubenlavin08/cc-discord-remote/actions/workflows/ci.yml)
+
+Drive [Claude Code](https://claude.com/claude-code) running in a terminal on your laptop from a Discord channel on your phone. Real live-attach to an already-running terminal session — every keystroke goes into the *actual* Claude process, every response streams back. Headless fallback via the Agent SDK when no terminal exists.
 
 ```
 ┌─────────┐   Discord    ┌──────────┐    Windows Console API   ┌──────────────┐
@@ -8,6 +12,15 @@ Drive [Claude Code](https://claude.com/claude-code) running in a terminal on you
 │ (you)   │ ◄────────────│ (Python) │ ◄──── JSONL tail ────────│ (in terminal)│
 └─────────┘              └──────────┘                          └──────────────┘
 ```
+
+## Highlights
+
+- **True live-attach**, not screen-scraping — `AttachConsole` + `WriteConsoleInput` against any running `claude.exe`
+- **Bidirectional mirror** — terminal activity streams to Discord, Discord messages stream to the terminal
+- **Per-tool Discord button approvals** — Claude can't run `Edit`/`Write`/`Bash` until you tap Approve on your phone
+- **One Discord channel per terminal** — `!cc spawn compressedprompt` auto-creates `#compressedprompt`, attached and mirroring
+- **Resilient** — channel↔terminal mappings persist in SQLite; bot restart restores every mirror
+- **Honest fallback** — when no live terminal exists for a session, headless Agent SDK takes over with the same JSONL format
 
 ## Why this exists
 
@@ -77,6 +90,13 @@ DEFAULT_CWD=C:/Users/<you>
 ## Tech stack
 
 Python 3.12 · `discord.py` 2.7 · `claude-agent-sdk` 0.2.82 · raw Win32 via `ctypes` · SQLite · async/await throughout.
+
+## Design decisions worth flagging
+
+- **Why a subprocess for `AttachConsole`?** A Win32 process can only own one console at a time. If the bot called `AttachConsole` directly it would corrupt its own stdio. Spawning `console_helper.py` as a one-shot subprocess per write isolates the attach so the parent process is never affected.
+- **Why tail the JSONL instead of reading the terminal screen?** `ReadConsoleOutputCharacter` only sees the visible window; long responses scroll off. The JSONL has the full structured history (text, tool_use, tool_result), which gives clean responses without ANSI codes or UI chrome.
+- **Why pair tool_use with tool_result by id?** Claude's session JSONL writes them as separate events. Pairing them in the bot means one Discord message per tool — `🛠️ Bash — ls *.py ↳ bot.py runner.py ...` — instead of two scattered ones.
+- **Why a "quiet for 3s + all tools resolved" turn-complete check?** A simpler "file stopped growing for 2s" check fires prematurely during slow tool calls (e.g., a Bash that takes 10s). Tracking unresolved tool IDs and requiring both signals avoids posting partial turns.
 
 ## License
 
