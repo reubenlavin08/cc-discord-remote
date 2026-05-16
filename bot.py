@@ -641,59 +641,67 @@ async def cmd_ask(channel, channel_id, user_id, prompt: str):
 
 # ---------- dispatch --------------------------------------------------------
 
+COMMANDS = {
+    "help", "status", "where", "new", "cancel", "live", "detach", "look",
+    "close", "cd", "sessions", "resume", "attach", "spawn",
+}
+
+
 async def dispatch(channel, channel_id: int, user_id: int, text: str):
-    """Route a raw '!cc <text>' style command (sans prefix) to the right handler."""
+    """Route a raw '!cc <text>' to a command OR forward as a prompt.
+
+    Strict first-word matching: if the first word is a known command, it is
+    ALWAYS dispatched as that command (extras ignored) and never falls through
+    to prompt mode. Prevents catastrophes like `!cc close X` being interpreted
+    as a prompt that asks an SDK Claude to "close X" via Bash.
+    """
     rest = text.strip()
-    if rest in ("", "help"):
+    if not rest:
         await cmd_help(channel, user_id)
         return
-    if rest == "status":
-        await cmd_status(channel, channel_id)
+
+    head, _, tail = rest.partition(" ")
+    head = head.lower()
+    tail = tail.strip()
+
+    if head in COMMANDS:
+        if head == "help":
+            await cmd_help(channel, user_id)
+        elif head in ("status", "where"):
+            await cmd_status(channel, channel_id)
+        elif head == "new":
+            await cmd_new(channel, channel_id, user_id)
+        elif head == "cancel":
+            await cmd_cancel(channel, channel_id)
+        elif head == "live":
+            await cmd_live(channel)
+        elif head == "detach":
+            await cmd_detach(channel, channel_id)
+        elif head == "look":
+            await cmd_look(channel, channel_id)
+        elif head == "close":
+            await cmd_close(channel, channel_id, user_id)
+        elif head == "cd":
+            await cmd_cd(channel, channel_id, user_id, tail.strip('"').strip("'"))
+        elif head == "sessions":
+            try:
+                n = int(tail) if tail else 10
+            except ValueError:
+                n = 10
+            await cmd_sessions(channel, n)
+        elif head == "resume":
+            await cmd_resume(channel, channel_id, user_id, tail)
+        elif head == "attach":
+            await cmd_attach(channel, channel_id, user_id, tail)
+        elif head == "spawn":
+            await cmd_spawn(channel, user_id, tail)
         return
-    if rest == "new":
-        await cmd_new(channel, channel_id, user_id)
-        return
-    if rest == "cancel":
-        await cmd_cancel(channel, channel_id)
-        return
-    if rest == "live":
-        await cmd_live(channel)
-        return
-    if rest.startswith("attach "):
-        await cmd_attach(channel, channel_id, user_id, rest[7:].strip())
-        return
-    if rest == "detach":
-        await cmd_detach(channel, channel_id)
-        return
-    if rest == "look":
-        await cmd_look(channel, channel_id)
-        return
-    if rest.startswith("spawn "):
-        await cmd_spawn(channel, user_id, rest[6:].strip())
-        return
-    if rest == "close":
-        await cmd_close(channel, channel_id, user_id)
-        return
-    if rest.startswith("cd "):
-        await cmd_cd(channel, channel_id, user_id, rest[3:].strip().strip('"').strip("'"))
-        return
-    if rest.startswith("sessions"):
-        parts = rest.split()
-        try:
-            n = int(parts[1]) if len(parts) > 1 else 10
-        except ValueError:
-            n = 10
-        await cmd_sessions(channel, n)
-        return
-    if rest.startswith("resume "):
-        await cmd_resume(channel, channel_id, user_id, rest[7:].strip())
-        return
-    # Otherwise treat as a prompt.
-    # If this channel is attached to a live terminal, send into it instead of the SDK.
+
+    # First word isn't a command — treat the whole thing as a prompt.
     if channel_id in attached_pids:
         await cmd_terminal_send(channel, channel_id, user_id, rest)
-        return
-    await cmd_ask(channel, channel_id, user_id, rest)
+    else:
+        await cmd_ask(channel, channel_id, user_id, rest)
 
 
 # ---------- Discord wiring --------------------------------------------------
