@@ -619,6 +619,20 @@ async def on_ready():
                 print(f"  slash sync failed for {chan.guild.id}: {e}")
 
 
+async def _safe_react(message: discord.Message, emoji: str):
+    try:
+        await message.add_reaction(emoji)
+    except Exception:
+        pass
+
+
+async def _safe_unreact(message: discord.Message, emoji: str):
+    try:
+        await message.remove_reaction(emoji, bot.user)
+    except Exception:
+        pass
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author == bot.user:
@@ -628,7 +642,17 @@ async def on_message(message: discord.Message):
     if not _is_authorised(message.author.id, message.channel.id):
         return
     rest = message.content[len(PREFIX):].strip()
-    await dispatch(message.channel, message.channel.id, message.author.id, rest)
+
+    # Immediate acknowledgement so the user knows the message was received.
+    await _safe_react(message, "⌛")
+    try:
+        await dispatch(message.channel, message.channel.id, message.author.id, rest)
+    except Exception:
+        await _safe_unreact(message, "⌛")
+        await _safe_react(message, "❌")
+        raise
+    await _safe_unreact(message, "⌛")
+    await _safe_react(message, "✅")
 
 
 @tree.command(name="cc", description="Drive Claude Code (try 'help' for commands)")
