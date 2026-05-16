@@ -36,6 +36,8 @@ load_dotenv()
 TOKEN = os.environ.get("DISCORD_TOKEN", "")
 ALLOWED_USERS = {int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip()}
 ALLOWED_CHANNELS = {int(x) for x in os.environ.get("ALLOWED_CHANNEL_IDS", "").split(",") if x.strip()}
+# Snapshot of the env-configured channels — never auto-deleted, even if unattached.
+CONTROL_CHANNELS = set(ALLOWED_CHANNELS)
 DEFAULT_CWD = os.environ.get("DEFAULT_CWD") or str(Path.cwd())
 
 PREFIX = "!cc"
@@ -746,6 +748,31 @@ async def on_ready():
                 _mirror_loop(chan, ch_id, primary_user, jsonl, jsonl.stat().st_size, label)
             )
             print(f"  restored attachment: channel {ch_id} -> PID {pid} ({label})")
+
+    # Auto-delete orphaned channels: previously-tracked channels with no active attachment
+    # and no role as an env-configured control channel.
+    orphan_ids = [
+        r[0] for r in sessions.conn.execute(
+            "SELECT channel_id FROM sessions WHERE attached_pid IS NULL"
+        )
+        if r[0] not in CONTROL_CHANNELS
+    ]
+    for ch_id in orphan_ids:
+        chan = bot.get_channel(ch_id)
+        if chan is None:
+            # Discord channel already gone — just clean the DB row.
+            sessions.conn.execute("DELETE FROM sessions WHERE channel_id = ?", (ch_id,))
+            continue
+        try:
+            await chan.delete(reason="cc-discord-remote: orphaned, no attached terminal")
+            sessions.conn.execute("DELETE FROM sessions WHERE channel_id = ?", (ch_id,))
+            ALLOWED_CHANNELS.discard(ch_id)
+            print(f"  auto-deleted orphan channel {ch_id}")
+        except discord.Forbidden:
+            print(f"  can't auto-delete channel {ch_id} (missing Manage Channels)")
+        except Exception as e:
+            print(f"  couldn't auto-delete channel {ch_id}: {e}")
+    sessions.conn.commit()
 
     # Sync slash commands to each guild the allowed channels live in (instant per-guild).
     synced_guilds = set()
