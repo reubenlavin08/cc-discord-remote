@@ -434,7 +434,24 @@ async def cmd_launch(channel, user_id: int, args: str):
         return
 
     sessions_dir = Path.home() / ".claude" / "sessions"
-    before = {int(f.stem) for f in sessions_dir.glob("*.json") if f.stem.isdigit()}
+
+    def _list_claude_pids() -> set:
+        """Get all running claude.exe PIDs via tasklist — works even before session JSON exists."""
+        try:
+            proc = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq claude.exe", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except Exception:
+            return set()
+        pids = set()
+        for line in proc.stdout.splitlines():
+            parts = [p.strip().strip('"') for p in line.split(",")]
+            if len(parts) >= 2 and parts[1].isdigit():
+                pids.add(int(parts[1]))
+        return pids
+
+    before_pids = _list_claude_pids()
 
     await channel.send(f"🚀 Launching new Claude in `{cwd}`…")
 
@@ -451,32 +468,48 @@ async def cmd_launch(channel, user_id: int, args: str):
         await channel.send(f"⚠️ Couldn't launch: `{type(e).__name__}: {e}`")
         return
 
-    # Wait up to 30s for the new claude.exe to register a session file.
+    # Wait for a new claude.exe to appear via tasklist (faster than waiting for the
+    # session JSON, which doesn't exist until trust prompt is accepted).
     new_pid: Optional[int] = None
     deadline = time.time() + 30
     while time.time() < deadline:
-        await asyncio.sleep(0.5)
-        current = {int(f.stem) for f in sessions_dir.glob("*.json") if f.stem.isdigit()}
-        diff = current - before
-        if diff:
-            new_pid = max(diff)  # most recent PID, in case race
+        await asyncio.sleep(1)
+        new_pids = _list_claude_pids() - before_pids
+        if new_pids:
+            new_pid = max(new_pids)
             break
 
     if not new_pid:
         await channel.send(
-            "⚠️ Launched the terminal but didn't detect a new Claude session within 30s. "
-            "Try `!cc live` to see if it eventually shows up."
+            "⚠️ Launched the PowerShell window but no new claude.exe appeared. "
+            "Check if a window opened with an error."
         )
         return
 
-    # Give Claude a moment to be ready for input, then send /rename.
+    # Give the trust prompt a moment to render, then accept it with Enter.
     await asyncio.sleep(2)
+    await _run_console_helper(new_pid, "", mode="enter")
+
+    # NOW wait for the session JSON to register (trust accepted, claude initialised).
+    session_deadline = time.time() + 30
+    while time.time() < session_deadline:
+        await asyncio.sleep(0.5)
+        if (sessions_dir / f"{new_pid}.json").is_file():
+            break
+    else:
+        await channel.send(
+            f"⚠️ PID {new_pid} started but no session JSON appeared within 30s. "
+            f"Trust prompt may still be open — try `!cc attach {new_pid}` then `!cc esc`."
+        )
+        return
+
+    # Inject /rename to give the new session the chosen name.
     rename_helper_out = await _run_console_helper(new_pid, f"/rename {name}", mode="type")
     if "AttachConsole" in rename_helper_out and "failed" in rename_helper_out:
         await channel.send(
             f"⚠️ Started PID {new_pid} but couldn't rename it: {rename_helper_out.strip()}"
         )
-    await asyncio.sleep(1.5)  # let the rename propagate to the registry
+    await asyncio.sleep(1.5)  # let the rename propagate
 
     # Create the Discord channel and attach.
     sanitized = _sanitize_channel_name(name)

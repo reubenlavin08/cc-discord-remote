@@ -206,7 +206,7 @@ def main():
     parser.add_argument("pid", type=int)
     parser.add_argument("prompt_file")
     parser.add_argument("output_file")
-    parser.add_argument("--mode", choices=("send", "look", "type", "esc"), default="send")
+    parser.add_argument("--mode", choices=("send", "look", "type", "esc", "enter"), default="send")
     args = parser.parse_args()
 
     out_path = Path(args.output_file)
@@ -234,6 +234,15 @@ def main():
                     _key_event("\x1b", False, VK_ESCAPE),
                 ])
                 out_path.write_text("esc-sent\n", encoding="utf-8")
+                return
+
+            if args.mode == "enter":
+                # Send a single Enter — used to accept defaults (trust prompts, etc.).
+                _flush_events(h_in, [
+                    _key_event("\r", True, VK_RETURN),
+                    _key_event("\r", False, VK_RETURN),
+                ])
+                out_path.write_text("enter-sent\n", encoding="utf-8")
                 return
 
             if args.mode == "type":
