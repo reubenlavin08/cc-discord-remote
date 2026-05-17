@@ -30,6 +30,7 @@ FILE_SHARE_WRITE = 0x2
 OPEN_EXISTING = 3
 KEY_EVENT = 0x1
 VK_RETURN = 0x0D
+VK_ESCAPE = 0x1B
 INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 
 
@@ -205,7 +206,7 @@ def main():
     parser.add_argument("pid", type=int)
     parser.add_argument("prompt_file")
     parser.add_argument("output_file")
-    parser.add_argument("--mode", choices=("send", "look", "type"), default="send")
+    parser.add_argument("--mode", choices=("send", "look", "type", "esc"), default="send")
     args = parser.parse_args()
 
     out_path = Path(args.output_file)
@@ -226,6 +227,15 @@ def main():
         h_in = _open_console_handle("CONIN$")
 
         try:
+            if args.mode == "esc":
+                # Send a single Escape keystroke — used to dismiss dialogs the TUI is showing.
+                _flush_events(h_in, [
+                    _key_event("\x1b", True, VK_ESCAPE),
+                    _key_event("\x1b", False, VK_ESCAPE),
+                ])
+                out_path.write_text("esc-sent\n", encoding="utf-8")
+                return
+
             if args.mode == "type":
                 # Type only — no screen polling. Caller will watch the session JSONL.
                 text = Path(args.prompt_file).read_text(encoding="utf-8")

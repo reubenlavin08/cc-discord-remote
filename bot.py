@@ -557,6 +557,20 @@ async def cmd_look(channel, channel_id):
     await send_chunked(channel, f"```\n{screen[-3500:]}\n```")
 
 
+async def cmd_esc(channel, channel_id):
+    """Send a single Escape keystroke — dismisses /usage and other TUI dialogs."""
+    pid = attached_pids.get(channel_id)
+    if pid is None:
+        await channel.send("Not attached. `!cc attach <name>` first.")
+        return
+    async with channel.typing():
+        result = await _run_console_helper(pid, "", mode="esc")
+    if "AttachConsole" in result and "failed" in result:
+        await channel.send(f"⚠️ {result.strip()}")
+    else:
+        await channel.send("⎋ Escape sent.")
+
+
 async def _render_piece(channel, kind: str, data: dict, pending_tools: Dict[str, tuple]):
     """Render one parsed JSONL piece into Discord, pairing tools with their results."""
     if kind == "text":
@@ -787,7 +801,7 @@ async def cmd_ask(channel, channel_id, user_id, prompt: str):
 
 COMMANDS = {
     "help", "status", "where", "new", "cancel", "live", "detach", "look",
-    "close", "cd", "sessions", "resume", "attach", "spawn", "launch", "usage",
+    "close", "cd", "sessions", "resume", "attach", "spawn", "launch", "usage", "esc",
 }
 
 
@@ -823,6 +837,8 @@ async def dispatch(channel, channel_id: int, user_id: int, text: str):
             await cmd_detach(channel, channel_id)
         elif head == "look":
             await cmd_look(channel, channel_id)
+        elif head == "esc":
+            await cmd_esc(channel, channel_id)
         elif head == "close":
             await cmd_close(channel, channel_id, user_id)
         elif head == "cd":
