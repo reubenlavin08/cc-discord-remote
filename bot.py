@@ -438,10 +438,11 @@ async def cmd_launch(channel, user_id: int, args: str):
 
     await channel.send(f"🚀 Launching new Claude in `{cwd}`…")
 
-    # Spawn in a new visible console so the user can also interact with it locally.
+    # Spawn in a new visible console. `claude` is a .ps1 script, so we need ExecutionPolicy
+    # Bypass — subprocess-launched PowerShell can land on a restricted policy.
     try:
         subprocess.Popen(
-            ["powershell.exe", "-NoExit", "-Command", "claude"],
+            ["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-Command", "claude"],
             creationflags=subprocess.CREATE_NEW_CONSOLE,
             cwd=cwd,
             close_fds=True,
