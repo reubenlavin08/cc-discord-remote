@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -46,8 +47,9 @@ MAX_CHUNK = 1900
 HELP_TEXT = (
     f"**Claude Code remote**\n\n"
     f"**Multi-channel** — one Discord channel per terminal:\n"
-    f"`{PREFIX} spawn <name>` — make a new channel auto-attached to that terminal\n"
-    f"`{PREFIX} close` — detach + delete this channel (only in spawned ones)\n\n"
+    f"`{PREFIX} launch <name> [cwd]` — start a *brand-new* terminal, name it, attach a channel\n"
+    f"`{PREFIX} spawn <name>` — attach a new channel to an *existing* running terminal\n"
+    f"`{PREFIX} close` — detach + delete this channel\n\n"
     f"**Per-channel attach** (manual):\n"
     f"`{PREFIX} live` — list running Claude Code processes\n"
     f"`{PREFIX} attach <name>` — drive that terminal from this channel\n"
@@ -351,6 +353,83 @@ async def cmd_spawn(channel, user_id: int, query: str):
     await channel.send(f"📡 Spawned <#{new_chan.id}> attached to `{channel_name}` (PID {match.pid}).")
 
 
+async def cmd_launch(channel, user_id: int, args: str):
+    """Launch a brand-new claude.exe in a new console, rename it, attach to a new channel."""
+    if not channel.guild:
+        await channel.send("Can only launch from inside a server.")
+        return
+    parts = args.strip().split(maxsplit=1) if args else []
+    if not parts:
+        await channel.send(f"Usage: `{PREFIX} launch <name> [working-dir]`\nExample: `{PREFIX} launch helmet C:/esp-projects/vl53l8cx_esp32`")
+        return
+    name = parts[0]
+    cwd = parts[1].strip().strip('"').strip("'") if len(parts) > 1 else DEFAULT_CWD
+    if not Path(cwd).is_dir():
+        await channel.send(f"Not a directory: `{cwd}`")
+        return
+
+    sessions_dir = Path.home() / ".claude" / "sessions"
+    before = {int(f.stem) for f in sessions_dir.glob("*.json") if f.stem.isdigit()}
+
+    await channel.send(f"🚀 Launching new Claude in `{cwd}`…")
+
+    # Spawn in a new visible console so the user can also interact with it locally.
+    try:
+        subprocess.Popen(
+            ["powershell.exe", "-NoExit", "-Command", "claude"],
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
+            cwd=cwd,
+            close_fds=True,
+        )
+    except Exception as e:
+        await channel.send(f"⚠️ Couldn't launch: `{type(e).__name__}: {e}`")
+        return
+
+    # Wait up to 30s for the new claude.exe to register a session file.
+    new_pid: Optional[int] = None
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        await asyncio.sleep(0.5)
+        current = {int(f.stem) for f in sessions_dir.glob("*.json") if f.stem.isdigit()}
+        diff = current - before
+        if diff:
+            new_pid = max(diff)  # most recent PID, in case race
+            break
+
+    if not new_pid:
+        await channel.send(
+            "⚠️ Launched the terminal but didn't detect a new Claude session within 30s. "
+            "Try `!cc live` to see if it eventually shows up."
+        )
+        return
+
+    # Give Claude a moment to be ready for input, then send /rename.
+    await asyncio.sleep(2)
+    rename_helper_out = await _run_console_helper(new_pid, f"/rename {name}", mode="type")
+    if "AttachConsole" in rename_helper_out and "failed" in rename_helper_out:
+        await channel.send(
+            f"⚠️ Started PID {new_pid} but couldn't rename it: {rename_helper_out.strip()}"
+        )
+    await asyncio.sleep(1.5)  # let the rename propagate to the registry
+
+    # Create the Discord channel and attach.
+    sanitized = _sanitize_channel_name(name)
+    try:
+        new_chan = await channel.guild.create_text_channel(name=sanitized)
+    except discord.Forbidden:
+        await channel.send(
+            "⚠️ Started the terminal but can't make a channel — bot needs **Manage Channels**."
+        )
+        return
+    except discord.HTTPException as e:
+        await channel.send(f"⚠️ Couldn't create channel: {e}")
+        return
+
+    ALLOWED_CHANNELS.add(new_chan.id)
+    await cmd_attach(new_chan, new_chan.id, user_id, str(new_pid))
+    await channel.send(f"📡 New terminal `{name}` (PID {new_pid}) up in <#{new_chan.id}>.")
+
+
 async def cmd_close(channel, channel_id, user_id):
     """Detach (if attached) and delete this channel. Works on orphaned channels too."""
     pid = attached_pids.pop(channel_id, None)
@@ -643,7 +722,7 @@ async def cmd_ask(channel, channel_id, user_id, prompt: str):
 
 COMMANDS = {
     "help", "status", "where", "new", "cancel", "live", "detach", "look",
-    "close", "cd", "sessions", "resume", "attach", "spawn",
+    "close", "cd", "sessions", "resume", "attach", "spawn", "launch",
 }
 
 
@@ -695,6 +774,8 @@ async def dispatch(channel, channel_id: int, user_id: int, text: str):
             await cmd_attach(channel, channel_id, user_id, tail)
         elif head == "spawn":
             await cmd_spawn(channel, user_id, tail)
+        elif head == "launch":
+            await cmd_launch(channel, user_id, tail)
         return
 
     # First word isn't a command — treat the whole thing as a prompt.
