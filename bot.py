@@ -51,7 +51,7 @@ HELP_TEXT = (
     f"**Multi-channel** — one Discord channel per terminal:\n"
     f"`{PREFIX} launch <name> [cwd]` — start a *brand-new* terminal, name it, attach a channel\n"
     f"`{PREFIX} spawn <name>` — attach a new channel to an *existing* running terminal\n"
-    f"`{PREFIX} close` — detach + delete this channel\n\n"
+    f"`{PREFIX} close [name]` — detach + delete a channel (this one, or named)\n\n"
     f"**Per-channel attach** (manual):\n"
     f"`{PREFIX} live` — list running Claude Code processes\n"
     f"`{PREFIX} attach <name>` — drive that terminal from this channel\n"
@@ -532,20 +532,48 @@ async def cmd_launch(channel, user_id: int, args: str):
     await channel.send(f"📡 New terminal `{name}` (PID {new_pid}) up in <#{new_chan.id}>.")
 
 
-async def cmd_close(channel, channel_id, user_id):
-    """Detach (if attached) and delete this channel. Works on orphaned channels too."""
-    pid = attached_pids.pop(channel_id, None)
-    mt = mirror_tasks.pop(channel_id, None)
+async def cmd_close(channel, channel_id, user_id, name: str = ""):
+    """Detach (if attached) and delete a channel.
+
+    `!cc close`         — close THIS channel.
+    `!cc close <name>`  — close the channel matching <name> (resolved against
+                          guild channels by sanitized name). Refuses to fall
+                          back to current channel if <name> doesn't match —
+                          otherwise a typo would nuke the wrong room.
+    """
+    target = channel
+    if name:
+        sanitized = _sanitize_channel_name(name)
+        match = discord.utils.get(channel.guild.text_channels, name=sanitized) if channel.guild else None
+        if match is None:
+            await channel.send(
+                f"⚠️ No channel named `#{sanitized}` in this server. "
+                f"Refusing to close — type `!cc close` (no name) to close this channel."
+            )
+            return
+        target = match
+
+    target_id = target.id
+    if target_id in CONTROL_CHANNELS:
+        await channel.send(
+            f"⚠️ <#{target_id}> is an env-configured control channel — refusing to delete. "
+            f"Remove it from `ALLOWED_CHANNEL_IDS` first if you really mean it."
+        )
+        return
+    pid = attached_pids.pop(target_id, None)
+    mt = mirror_tasks.pop(target_id, None)
     if mt and not mt.done():
         mt.cancel()
-    sessions.set_attached_pid(channel_id, None)
-    ALLOWED_CHANNELS.discard(channel_id)
+    sessions.set_attached_pid(target_id, None)
+    ALLOWED_CHANNELS.discard(target_id)
     try:
-        msg = f"🔌 Closing (was on PID {pid})…" if pid else "🔌 Closing channel…"
-        await channel.send(msg)
-        await channel.delete()
+        if target_id != channel_id:
+            await channel.send(f"🔌 Closing <#{target_id}> (was on PID {pid})…" if pid else f"🔌 Closing <#{target_id}>…")
+        else:
+            await channel.send(f"🔌 Closing (was on PID {pid})…" if pid else "🔌 Closing channel…")
+        await target.delete()
     except discord.Forbidden:
-        await channel.send("⚠️ Bot needs **Manage Channels** to delete this channel.")
+        await channel.send("⚠️ Bot needs **Manage Channels** to delete that channel.")
     except discord.HTTPException as e:
         await channel.send(f"⚠️ Couldn't delete channel: {e}")
 
@@ -877,7 +905,7 @@ async def dispatch(channel, channel_id: int, user_id: int, text: str):
         elif head == "esc":
             await cmd_esc(channel, channel_id)
         elif head == "close":
-            await cmd_close(channel, channel_id, user_id)
+            await cmd_close(channel, channel_id, user_id, tail)
         elif head == "cd":
             await cmd_cd(channel, channel_id, user_id, tail.strip('"').strip("'"))
         elif head == "sessions":
