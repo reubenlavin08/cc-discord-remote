@@ -272,15 +272,18 @@ async def cmd_attach(channel, channel_id, user_id, query: str):
 
     # Start the bidirectional mirror: anything Claude writes to this session's JSONL —
     # whether triggered from Discord OR typed locally in the terminal — gets posted here.
+    # File may not exist yet when attaching to a fresh terminal (Claude creates the JSONL
+    # on first activity, not at launch). _mirror_loop already tolerates missing files via
+    # its stat() retry, so we always start it — it'll begin tailing once the file appears.
     jsonl = session_jsonl_path(match.cwd, match.session_id)
+    start_offset = jsonl.stat().st_size if jsonl.is_file() else 0
+    mirror_tasks[channel_id] = asyncio.create_task(
+        _mirror_loop(channel, channel_id, user_id, jsonl, start_offset, label)
+    )
     if jsonl.is_file():
-        start_offset = jsonl.stat().st_size
-        mirror_tasks[channel_id] = asyncio.create_task(
-            _mirror_loop(channel, channel_id, user_id, jsonl, start_offset, label)
-        )
         mirror_note = f"\n📡 Live mirror started — anything Claude does will appear here."
     else:
-        mirror_note = f"\n⚠️ Couldn't find session JSONL at `{jsonl}` — mirror disabled."
+        mirror_note = f"\n📡 Live mirror armed — starts when Claude writes its first message."
 
     await channel.send(
         f"🔌 Attached to `{label}` (PID {match.pid}). Prompts now go into that terminal."
