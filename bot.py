@@ -936,6 +936,8 @@ async def dispatch(channel, channel_id: int, user_id: int, text: str):
 # ---------- Discord wiring --------------------------------------------------
 
 _pid_watcher_started = False
+_auto_spawn_watcher_started = False
+_auto_spawn_seen: set = set()  # PIDs we've already processed — populated on first poll
 
 
 async def _pid_watcher(interval: float = 15.0):
@@ -980,6 +982,74 @@ async def _pid_watcher(interval: float = 15.0):
             raise
         except Exception as e:
             print(f"  _pid_watcher error (continuing): {e}")
+
+
+async def _auto_spawn_watcher(interval: float = 15.0):
+    """Poll for newly-appeared claude.exe sessions; auto-create a Discord channel.
+
+    Seeds with all currently-running claude.exes on the FIRST iteration so the
+    bot doesn't spam channels for pre-existing sessions at startup. After that,
+    any new claude session (the user typed `claude` in a terminal) gets its own
+    channel automatically, named after `/rename` if set, else session-id prefix.
+
+    Channels are created in the guild of the first env-configured control room.
+    Skips sessions that are already attached to a channel (in attached_pids).
+    """
+    primary_user = next(iter(ALLOWED_USERS), 0)
+    first_pass = True
+
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            running = list_running()
+            current_pids = {c.pid for c in running}
+
+            if first_pass:
+                _auto_spawn_seen.update(current_pids)
+                first_pass = False
+                continue
+
+            # Drop dead PIDs from seen so PID-reuse doesn't suppress legitimate new sessions.
+            _auto_spawn_seen.intersection_update(current_pids)
+
+            already_attached = set(attached_pids.values())
+            new_sessions = [c for c in running if c.pid not in _auto_spawn_seen and c.pid not in already_attached]
+            if not new_sessions:
+                continue
+
+            # Pick a guild from the first reachable control room.
+            guild = None
+            for cid in CONTROL_CHANNELS:
+                ch = bot.get_channel(cid)
+                if ch and getattr(ch, "guild", None):
+                    guild = ch.guild
+                    break
+            if guild is None:
+                # No control room found — mark new PIDs as seen so we don't retry forever.
+                _auto_spawn_seen.update(c.pid for c in new_sessions)
+                continue
+
+            for info in new_sessions:
+                _auto_spawn_seen.add(info.pid)
+                channel_name = _sanitize_channel_name(info.name or info.session_id[:8])
+                try:
+                    new_chan = await guild.create_text_channel(name=channel_name)
+                except discord.Forbidden:
+                    print(f"  auto-spawn: missing Manage Channels in guild {guild.id}")
+                    continue
+                except discord.HTTPException as e:
+                    print(f"  auto-spawn: couldn't create channel for PID {info.pid}: {e}")
+                    continue
+                ALLOWED_CHANNELS.add(new_chan.id)
+                try:
+                    await cmd_attach(new_chan, new_chan.id, primary_user, str(info.pid))
+                    print(f"  auto-spawned channel #{channel_name} for PID {info.pid}")
+                except Exception as e:
+                    print(f"  auto-spawn: attach failed for PID {info.pid}: {e}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"  _auto_spawn_watcher error (continuing): {e}")
 
 
 @bot.event
@@ -1059,10 +1129,13 @@ async def on_ready():
     sessions.conn.commit()
 
     # Sync slash commands to each guild the allowed channels live in (instant per-guild).
-    global _pid_watcher_started
+    global _pid_watcher_started, _auto_spawn_watcher_started
     if not _pid_watcher_started:
         _pid_watcher_started = True
         asyncio.create_task(_pid_watcher())
+    if not _auto_spawn_watcher_started:
+        _auto_spawn_watcher_started = True
+        asyncio.create_task(_auto_spawn_watcher())
 
     synced_guilds = set()
     for chan_id in ALLOWED_CHANNELS:
