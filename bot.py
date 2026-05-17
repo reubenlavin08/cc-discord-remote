@@ -385,11 +385,26 @@ async def cmd_usage(channel):
     msgs = data.get("messages", 0)
     prompts = data.get("user_prompts", 0)
 
-    lines = [
-        f"**📊 Claude usage** — most-recently-active session",
-        f"`{title}` · `{cwd}` · {model}",
-        f"context: **{pct:.1f}%** · {msgs} msgs ({prompts} prompts) · **${cost:.2f}**",
-    ]
+    ru = data.get("real_usage") or {}
+    five_h = ru.get("five_hour_pct")
+    five_h_reset = ru.get("five_hour_reset")
+    week = ru.get("week_all_pct")
+    week_reset = ru.get("week_all_reset")
+    week_sonnet = ru.get("week_sonnet_pct")
+
+    lines = [f"**📊 Claude usage**"]
+    if five_h is not None:
+        suffix = f" · resets {five_h_reset}" if five_h_reset else ""
+        lines.append(f"5h: **{five_h:.0f}%**{suffix}")
+    if week is not None:
+        suffix = f" · resets {week_reset}" if week_reset else ""
+        sonnet_part = f" (Sonnet: {week_sonnet:.0f}%)" if week_sonnet else ""
+        lines.append(f"weekly: **{week:.0f}%**{sonnet_part}{suffix}")
+
+    lines.append(
+        f"\n**Active session** — `{title}` · `{cwd}` · {model}\n"
+        f"context: **{pct:.1f}%** · {msgs} msgs ({prompts} prompts) · ${cost:.2f}"
+    )
 
     others = data.get("other_sessions") or []
     if others:
@@ -399,11 +414,6 @@ async def cmd_usage(channel):
             lines.append(
                 f"`{t}` · {_pct(s):.0f}% ctx · ${s.get('cost_usd', 0):.2f}"
             )
-
-    lines.append(
-        f"\n_5h / weekly limits aren't in this WS payload — see the dashboard at "
-        f"{CLAUDE_MONITOR_WS.replace('ws://', 'http://').replace('/ws', '/')} for those._"
-    )
 
     await send_chunked(channel, "\n".join(lines))
 
