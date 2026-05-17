@@ -44,6 +44,8 @@ DEFAULT_CWD = os.environ.get("DEFAULT_CWD") or str(Path.cwd())
 PREFIX = "!cc"
 MAX_CHUNK = 1900
 
+CLAUDE_MONITOR_WS = os.environ.get("CLAUDE_MONITOR_WS", "ws://192.168.1.242:8765/ws")
+
 HELP_TEXT = (
     f"**Claude Code remote**\n\n"
     f"**Multi-channel** — one Discord channel per terminal:\n"
@@ -351,6 +353,59 @@ async def cmd_spawn(channel, user_id: int, query: str):
     # Attach the new channel to the terminal.
     await cmd_attach(new_chan, new_chan.id, user_id, str(match.pid))
     await channel.send(f"📡 Spawned <#{new_chan.id}> attached to `{channel_name}` (PID {match.pid}).")
+
+
+async def cmd_usage(channel):
+    """Fetch the latest snapshot from your claude-monitor dashboard's WebSocket."""
+    import aiohttp  # already a transitive dep of discord.py
+
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.ws_connect(CLAUDE_MONITOR_WS, timeout=5) as ws:
+                msg = await asyncio.wait_for(ws.receive(), timeout=6)
+                if msg.type != aiohttp.WSMsgType.TEXT:
+                    await channel.send(f"⚠️ Unexpected WS message type from claude-monitor: {msg.type}")
+                    return
+                data = json.loads(msg.data)
+    except Exception as e:
+        await channel.send(
+            f"⚠️ Couldn't reach claude-monitor at `{CLAUDE_MONITOR_WS}`: "
+            f"`{type(e).__name__}: {e}`"
+        )
+        return
+
+    def _pct(s):
+        return (s.get("context_tokens", 0) / max(s.get("max_context", 1), 1)) * 100
+
+    title = data.get("title") or data.get("session_id", "?")[:8]
+    cwd = data.get("cwd", "?")
+    model = data.get("model_name", "?")
+    pct = _pct(data)
+    cost = data.get("cost_usd", 0)
+    msgs = data.get("messages", 0)
+    prompts = data.get("user_prompts", 0)
+
+    lines = [
+        f"**📊 Claude usage** — most-recently-active session",
+        f"`{title}` · `{cwd}` · {model}",
+        f"context: **{pct:.1f}%** · {msgs} msgs ({prompts} prompts) · **${cost:.2f}**",
+    ]
+
+    others = data.get("other_sessions") or []
+    if others:
+        lines.append(f"\n**Other recent sessions** (top {min(len(others), 10)}):")
+        for s in others[:10]:
+            t = s.get("title") or s.get("session_id", "?")[:8]
+            lines.append(
+                f"`{t}` · {_pct(s):.0f}% ctx · ${s.get('cost_usd', 0):.2f}"
+            )
+
+    lines.append(
+        f"\n_5h / weekly limits aren't in this WS payload — see the dashboard at "
+        f"{CLAUDE_MONITOR_WS.replace('ws://', 'http://').replace('/ws', '/')} for those._"
+    )
+
+    await send_chunked(channel, "\n".join(lines))
 
 
 async def cmd_launch(channel, user_id: int, args: str):
@@ -722,7 +777,7 @@ async def cmd_ask(channel, channel_id, user_id, prompt: str):
 
 COMMANDS = {
     "help", "status", "where", "new", "cancel", "live", "detach", "look",
-    "close", "cd", "sessions", "resume", "attach", "spawn", "launch",
+    "close", "cd", "sessions", "resume", "attach", "spawn", "launch", "usage",
 }
 
 
@@ -776,6 +831,8 @@ async def dispatch(channel, channel_id: int, user_id: int, text: str):
             await cmd_spawn(channel, user_id, tail)
         elif head == "launch":
             await cmd_launch(channel, user_id, tail)
+        elif head == "usage":
+            await cmd_usage(channel)
         return
 
     # First word isn't a command — treat the whole thing as a prompt.
