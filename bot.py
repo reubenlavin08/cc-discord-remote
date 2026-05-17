@@ -26,7 +26,7 @@ import sys
 import tempfile
 
 from approvals import request_approval
-from live_processes import find_by_pid, list_running, session_jsonl_path
+from live_processes import find_by_pid, list_running, pid_alive, session_jsonl_path
 from runner import READ_ONLY_TOOLS, run_turn
 from session_files import find_by_prefix, find_live_session, format_age, list_recent_sessions
 from session_tail import extract_user_facing, wait_for_completion
@@ -935,6 +935,53 @@ async def dispatch(channel, channel_id: int, user_id: int, text: str):
 
 # ---------- Discord wiring --------------------------------------------------
 
+_pid_watcher_started = False
+
+
+async def _pid_watcher(interval: float = 15.0):
+    """Poll attached PIDs; when a claude.exe exits, auto-close its Discord channel.
+
+    Control rooms (env-configured ALLOWED_CHANNEL_IDS) are NEVER deleted — they
+    just get their dead attachment cleared so the channel survives a Claude
+    restart. Other channels get a goodbye message then are deleted.
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            for ch_id, pid in list(attached_pids.items()):
+                if pid_alive(pid):
+                    continue
+                attached_pids.pop(ch_id, None)
+                mt = mirror_tasks.pop(ch_id, None)
+                if mt and not mt.done():
+                    mt.cancel()
+                sessions.set_attached_pid(ch_id, None)
+
+                if ch_id in CONTROL_CHANNELS:
+                    continue
+
+                ALLOWED_CHANNELS.discard(ch_id)
+                chan = bot.get_channel(ch_id)
+                if chan is None:
+                    sessions.conn.execute("DELETE FROM sessions WHERE channel_id = ?", (ch_id,))
+                    sessions.conn.commit()
+                    continue
+                try:
+                    await chan.send(f"🪦 Terminal exited (PID {pid} gone) — closing this channel.")
+                    await chan.delete(reason="cc-discord-remote: terminal exited")
+                    sessions.conn.execute("DELETE FROM sessions WHERE channel_id = ?", (ch_id,))
+                    sessions.conn.commit()
+                    print(f"  auto-closed channel {ch_id} (PID {pid} died)")
+                except discord.Forbidden:
+                    print(f"  can't auto-close channel {ch_id} (missing Manage Channels)")
+                except Exception as e:
+                    print(f"  couldn't auto-close channel {ch_id}: {e}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"  _pid_watcher error (continuing): {e}")
+
+
 @bot.event
 async def on_ready():
     print(f"Bot online as {bot.user}")
@@ -1012,6 +1059,11 @@ async def on_ready():
     sessions.conn.commit()
 
     # Sync slash commands to each guild the allowed channels live in (instant per-guild).
+    global _pid_watcher_started
+    if not _pid_watcher_started:
+        _pid_watcher_started = True
+        asyncio.create_task(_pid_watcher())
+
     synced_guilds = set()
     for chan_id in ALLOWED_CHANNELS:
         chan = bot.get_channel(chan_id)

@@ -20,7 +20,7 @@ class LiveClaude:
     started_at_ms: Optional[int] = None
 
 
-def _pid_alive(pid: int) -> bool:
+def pid_alive(pid: int) -> bool:
     h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if h:
         ctypes.windll.kernel32.CloseHandle(h)
@@ -38,7 +38,7 @@ def list_running() -> List[LiveClaude]:
         except (OSError, json.JSONDecodeError):
             continue
         pid = data.get("pid")
-        if not pid or not _pid_alive(pid):
+        if not pid or not pid_alive(pid):
             continue
         out.append(
             LiveClaude(
