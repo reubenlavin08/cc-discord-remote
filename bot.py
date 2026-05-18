@@ -378,7 +378,11 @@ def _screen_shows_approval_popup(screen: str) -> bool:
 # Indicators that the visible screen has something the user can navigate
 # (picker cursor, checkboxes, or a numbered selection list). Used after a
 # slash command to decide whether to auto-attach a keypad to the snapshot.
-_NAVIGABLE_CURSOR_RE = re.compile(r"^\s*[▶❯▷]\s+\S", re.M)
+_NAVIGABLE_CURSOR_RE = re.compile(
+    r"^\s*[▶❯▷]\s+\S"            # box-drawing cursors
+    r"|^\s*>\s+[√✓✗(\[]",        # `>` followed by a checkbox/check glyph (menu cursor)
+    re.M,
+)
 _NAVIGABLE_CHECKBOX_RE = re.compile(r"[(\[][√✓✗x• ][)\]]", re.I)
 _NAVIGABLE_NUMBERED_RE = re.compile(r"^\s+\d+[.):]\s+\S", re.M)
 
@@ -1468,17 +1472,16 @@ async def cmd_terminal_send(channel, channel_id, user_id, text: str):
         return True
 
     if is_slash:
-        # Trim to fit in a single Discord message so we can attach a keypad
-        # view if the screen looks navigable (a picker/menu opened).
+        # Always attach a keypad to slash-command snapshots — the user almost
+        # always wants a way to navigate back / Esc / scroll, even if the
+        # snapshot is a static info page. The earlier heuristic was too clever
+        # and would silently omit the keypad on detail views.
         body = result[-1800:] if result.strip() else "_(screen empty)_"
         formatted = f"```\n{body}\n```"
-        if _screen_looks_navigable(result):
-            view = RemoteKeypadView(channel_id)
-            view.timeout = 600  # 10 min for auto-attached pads vs 1 h manual
-            msg = await channel.send(formatted, view=view)
-            view.message = msg
-        else:
-            await send_chunked(channel, formatted)
+        view = RemoteKeypadView(channel_id)
+        view.timeout = 600  # 10 min for auto-attached pads vs 1 h manual
+        msg = await channel.send(formatted, view=view)
+        view.message = msg
     return True
 
 

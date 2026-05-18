@@ -127,6 +127,7 @@ MAPVK_VK_TO_VSC = 0
 STABLE_SECONDS = 1.5
 MAX_WAIT_SECONDS = 60.0
 POLL_INTERVAL = 0.25
+NO_CHANGE_TIMEOUT = 8.0  # if screen never differs from baseline, give up after this
 
 
 # ---------- helpers ---------------------------------------------------------
@@ -319,17 +320,33 @@ def main():
 
             if args.mode == "send":
                 text = Path(args.prompt_file).read_text(encoding="utf-8")
+
+                # Snapshot the screen BEFORE typing so we can tell whether the
+                # TUI has actually reacted yet. Otherwise the stability check
+                # fires before the response renders and we return the
+                # pre-render screen.
+                baseline = _read_screen(h_out)
                 _write_text(h_in, text)
 
-                last = ""
-                last_change = time.time()
-                deadline = time.time() + MAX_WAIT_SECONDS
+                type_done_at = time.time()
+                last = baseline
+                last_change = type_done_at
+                saw_real_change = False
+                deadline = type_done_at + MAX_WAIT_SECONDS
                 while time.time() < deadline:
                     current = _read_screen(h_out)
                     if current != last:
                         last = current
                         last_change = time.time()
-                    elif time.time() - last_change >= STABLE_SECONDS:
+                        if current != baseline:
+                            saw_real_change = True
+                    elif saw_real_change and (time.time() - last_change) >= STABLE_SECONDS:
+                        # Screen has visibly reacted to the input AND has been
+                        # stable for STABLE_SECONDS — capture is ready.
+                        break
+                    elif (not saw_real_change) and (time.time() - type_done_at) >= NO_CHANGE_TIMEOUT:
+                        # TUI never visibly reacted (silent rejection, or command
+                        # produced no visible output). Bail with what we have.
                         break
                     time.sleep(POLL_INTERVAL)
                 final = last
