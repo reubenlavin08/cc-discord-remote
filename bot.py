@@ -520,6 +520,20 @@ class RemoteKeypadView(discord.ui.View):
         super().__init__(timeout=3600)
         self.channel_id = channel_id
 
+    async def _update_message_with_screen(self, interaction: discord.Interaction, pid: int):
+        """Read the current screen and edit this view's message to show it.
+
+        Gives the user live feedback in the same Discord message instead of
+        a follow-up per click. Errors are swallowed so a flaky read doesn't
+        break the interaction.
+        """
+        try:
+            screen = await _run_console_helper(pid, "", mode="look")
+            body = screen[-1800:] if screen.strip() else "_(screen empty)_"
+            await interaction.message.edit(content=f"```\n{body}\n```", view=self)
+        except (discord.HTTPException, OSError):
+            pass
+
     async def _send_key(self, interaction: discord.Interaction, key: str):
         if not _is_authorised(interaction.user.id, interaction.channel_id):
             await interaction.response.send_message("Unauthorized.", ephemeral=True)
@@ -533,6 +547,9 @@ class RemoteKeypadView(discord.ui.View):
         await interaction.response.defer()
         await _run_console_helper(pid, key, mode="keys")
         sessions.audit(self.channel_id, interaction.user.id, "keypad", key)
+        # Small beat so the TUI has time to redraw before we capture it.
+        await asyncio.sleep(0.4)
+        await self._update_message_with_screen(interaction, pid)
 
     async def _snapshot(self, interaction: discord.Interaction):
         if not _is_authorised(interaction.user.id, interaction.channel_id):
@@ -544,10 +561,8 @@ class RemoteKeypadView(discord.ui.View):
                 "Not attached anymore.", ephemeral=True
             )
             return
-        await interaction.response.defer(thinking=True)
-        screen = await _run_console_helper(pid, "", mode="look")
-        body = screen[-3500:] if screen.strip() else "_(screen empty)_"
-        await interaction.followup.send(f"```\n{body}\n```")
+        await interaction.response.defer()
+        await self._update_message_with_screen(interaction, pid)
 
     # Row 0 — top: ↑, modifier keys, Look
     @discord.ui.button(emoji="⬆️", style=discord.ButtonStyle.primary, row=0)
