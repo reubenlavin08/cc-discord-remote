@@ -1385,6 +1385,17 @@ async def cmd_terminal_send(channel, channel_id, user_id, text: str):
         ack = await _run_console_helper(pid, text, mode="type")
     if "AttachConsole" in ack and "failed" in ack:
         await channel.send(f"⚠️ {ack.strip()}")
+        return True
+
+    # Slash commands are TUI-only — they don't write to the JSONL, so the mirror
+    # loop never picks them up. Auto-snapshot the screen so the user can see
+    # what the command produced (popup, picker, dialog, etc.).
+    if text.lstrip().startswith("/"):
+        async with channel.typing():
+            await asyncio.sleep(1.5)
+            screen = await _run_console_helper(pid, "", mode="look")
+        body = screen[-3500:] if screen.strip() else "_(screen empty)_"
+        await send_chunked(channel, f"```\n{body}\n```")
     return True
 
 
