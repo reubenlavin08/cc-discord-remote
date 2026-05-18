@@ -568,12 +568,17 @@ class RemoteKeypadView(discord.ui.View):
         await interaction.response.defer()
         await self._update_message_with_screen(interaction, pid)
 
-    # Row 0 — top: ↑, modifier keys, Look
-    @discord.ui.button(emoji="⬆️", style=discord.ButtonStyle.primary, row=0)
-    async def k_up(self, i: discord.Interaction, _b): await self._send_key(i, "up")
+    # Button placement deliberately matches a physical keyboard arrow cluster:
+    # `⬆` sits in row 0 col 1 directly above `⬇` in row 1 col 1, with `⬅` and
+    # `➡` flanking — the classic inverted-T. The other utility keys fill the
+    # remaining slots in each row.
 
+    # Row 0 — Esc, ↑, Tab/Bksp/Look
     @discord.ui.button(label="Esc", style=discord.ButtonStyle.secondary, row=0)
     async def k_esc(self, i: discord.Interaction, _b): await self._send_key(i, "esc")
+
+    @discord.ui.button(emoji="⬆️", style=discord.ButtonStyle.primary, row=0)
+    async def k_up(self, i: discord.Interaction, _b): await self._send_key(i, "up")
 
     @discord.ui.button(label="Tab", style=discord.ButtonStyle.secondary, row=0)
     async def k_tab(self, i: discord.Interaction, _b): await self._send_key(i, "tab")
@@ -584,7 +589,7 @@ class RemoteKeypadView(discord.ui.View):
     @discord.ui.button(label="👁 Look", style=discord.ButtonStyle.success, row=0)
     async def k_look(self, i: discord.Interaction, _b): await self._snapshot(i)
 
-    # Row 1 — bottom row: ←, ↓, →, Enter, Space
+    # Row 1 — ←, ↓, →, Enter, Space
     @discord.ui.button(emoji="⬅️", style=discord.ButtonStyle.primary, row=1)
     async def k_left(self, i: discord.Interaction, _b): await self._send_key(i, "left")
 
