@@ -31,7 +31,30 @@ OPEN_EXISTING = 3
 KEY_EVENT = 0x1
 VK_RETURN = 0x0D
 VK_ESCAPE = 0x1B
+VK_UP = 0x26
+VK_DOWN = 0x28
+VK_LEFT = 0x25
+VK_RIGHT = 0x27
+VK_TAB = 0x09
+VK_BACK = 0x08
+VK_SPACE = 0x20
 INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+# Map keys mode tokens → (virtual-key, char). char="\0" for non-printable keys.
+NAMED_KEYS = {
+    "enter": (VK_RETURN, "\r"),
+    "return": (VK_RETURN, "\r"),
+    "esc": (VK_ESCAPE, "\x1b"),
+    "escape": (VK_ESCAPE, "\x1b"),
+    "up": (VK_UP, "\0"),
+    "down": (VK_DOWN, "\0"),
+    "left": (VK_LEFT, "\0"),
+    "right": (VK_RIGHT, "\0"),
+    "tab": (VK_TAB, "\t"),
+    "backspace": (VK_BACK, "\b"),
+    "bksp": (VK_BACK, "\b"),
+    "space": (VK_SPACE, " "),
+}
 
 
 class COORD(ctypes.Structure):
@@ -201,12 +224,45 @@ def _write_text(h_in: int, text: str):
     ])
 
 
+def _send_single_key(h_in: int, token: str) -> None:
+    """Send one key event for the named token or a single printable char (no trailing Enter)."""
+    key = token.lower()
+    if key in NAMED_KEYS:
+        vk, ch = NAMED_KEYS[key]
+    elif len(token) == 1:
+        ch = token
+        try:
+            vk = user32.VkKeyScanW(ch) & 0xFF if ch.isprintable() else 0
+        except Exception:
+            vk = 0
+    else:
+        raise ValueError(f"Unknown key token: {token!r}")
+    _flush_events(h_in, [
+        _key_event(ch, True, vk),
+        _key_event(ch, False, vk),
+    ])
+
+
+def _send_key_sequence(h_in: int, sequence: str) -> None:
+    """Parse a comma-separated sequence like `down,down,enter` or `1` and send each."""
+    for raw in sequence.split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        _send_single_key(h_in, token)
+        time.sleep(0.06)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("pid", type=int)
     parser.add_argument("prompt_file")
     parser.add_argument("output_file")
-    parser.add_argument("--mode", choices=("send", "look", "type", "esc", "enter"), default="send")
+    parser.add_argument(
+        "--mode",
+        choices=("send", "look", "type", "esc", "enter", "keys"),
+        default="send",
+    )
     args = parser.parse_args()
 
     out_path = Path(args.output_file)
@@ -243,6 +299,15 @@ def main():
                     _key_event("\r", False, VK_RETURN),
                 ])
                 out_path.write_text("enter-sent\n", encoding="utf-8")
+                return
+
+            if args.mode == "keys":
+                # Comma-separated sequence of named keys / single chars, no trailing Enter.
+                # e.g. `1` (single key, used for popup approval), `down,down,enter`,
+                # `space,tab,y,enter`. Each token sent as one key event with a tiny gap.
+                sequence = Path(args.prompt_file).read_text(encoding="utf-8").strip()
+                _send_key_sequence(h_in, sequence)
+                out_path.write_text(f"keys-sent: {sequence}\n", encoding="utf-8")
                 return
 
             if args.mode == "type":

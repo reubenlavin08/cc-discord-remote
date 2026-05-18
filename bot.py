@@ -56,7 +56,10 @@ HELP_TEXT = (
     f"`{PREFIX} live` — list running Claude Code processes\n"
     f"`{PREFIX} attach <name>` — drive that terminal from this channel\n"
     f"`{PREFIX} detach` — stop driving the terminal\n"
-    f"`{PREFIX} look` — snapshot the terminal screen\n\n"
+    f"`{PREFIX} look` — snapshot the terminal screen\n"
+    f"`{PREFIX} pad` — pop a clickable keypad (arrows / Enter / Esc / Tab / 1-5 / Look) for the attached terminal\n"
+    f"`{PREFIX} keys <seq>` — raw keys to the TUI (e.g. `down,down,enter`, `1`, `space,tab`)\n"
+    f"**Tool-approval popups** auto-surface as Discord buttons (✅ Allow / ❌ Deny / 💬 Deny + tell Claude).\n\n"
     f"**In an attached channel**, you can just type messages without `{PREFIX}` — they go straight to the terminal.\n\n"
     f"**SDK mode** (separate Claude process):\n"
     f"`{PREFIX} <prompt>` — drive Claude in a non-attached channel\n"
@@ -250,6 +253,10 @@ async def cmd_resume_spawn(channel, user_id: int, s):
         await channel.send("⚠️ PowerShell window opened but no claude.exe appeared.")
         return
 
+    # Pre-claim the PID so the auto-spawn watcher (15 s poll) doesn't race us and
+    # create a duplicate hex-id channel for the same terminal.
+    _auto_spawn_seen.add(new_pid)
+
     # Defensive Enter in case a trust prompt rendered.
     await asyncio.sleep(2)
     await _run_console_helper(new_pid, "", mode="enter")
@@ -338,6 +345,230 @@ class ResumePickerView(discord.ui.View):
     def __init__(self, summaries):
         super().__init__(timeout=180)
         self.add_item(ResumeSelect(summaries))
+
+
+# ---------- tool-approval bridge (attached-terminal mode) -------------------
+#
+# When Claude Code runs in a real terminal, tool-approval popups are TUI-only —
+# no `can_use_tool` callback. We detect them via timing: a non-readonly tool_use
+# that's been unresolved for ≥3 s probably has a popup waiting. Surface buttons
+# that drive the popup with number keys via `console_helper.py keys`.
+
+
+class DenyInstructModal(discord.ui.Modal, title="Tell Claude what to do differently"):
+    instruction = discord.ui.TextInput(
+        label="Instruction",
+        style=discord.TextStyle.paragraph,
+        placeholder="Why this is wrong, and what Claude should do instead.",
+        required=True,
+        max_length=2000,
+    )
+
+    def __init__(self, parent_view: "ToolApprovalView"):
+        super().__init__()
+        self.parent_view = parent_view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not _is_authorised(interaction.user.id, interaction.channel_id):
+            await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            return
+        pid = attached_pids.get(self.parent_view.channel_id)
+        if pid is None:
+            await interaction.response.send_message(
+                "Not attached anymore — can't reach the terminal.", ephemeral=True
+            )
+            return
+        await interaction.response.defer()
+        # Select "Deny + instruct" (option 3) in the popup.
+        await _run_console_helper(pid, "3", mode="keys")
+        # Give the TUI a beat to switch the popup into text-input mode.
+        await asyncio.sleep(0.6)
+        # Type the instruction; `type` mode appends Enter to submit.
+        await _run_console_helper(pid, str(self.instruction), mode="type")
+        sessions.audit(
+            self.parent_view.channel_id,
+            interaction.user.id,
+            "tool_approval",
+            f"{self.parent_view.tool_name}:Deny+Instruct",
+        )
+        for child in self.parent_view.children:
+            child.disabled = True
+        self.parent_view.stop()
+        msg = self.parent_view.message
+        if msg is not None:
+            try:
+                snippet = str(self.instruction)[:200]
+                await msg.edit(
+                    content=f"{msg.content}\n→ **Deny + instruct** by <@{interaction.user.id}>: {snippet}",
+                    view=self.parent_view,
+                )
+            except discord.HTTPException:
+                pass
+
+
+class ToolApprovalView(discord.ui.View):
+    def __init__(self, channel_id: int, tool_id: str, tool_name: str):
+        super().__init__(timeout=600)
+        self.channel_id = channel_id
+        self.tool_id = tool_id
+        self.tool_name = tool_name
+
+    async def _send_keystroke(
+        self,
+        interaction: discord.Interaction,
+        sequence: str,
+        action_label: str,
+    ):
+        if not _is_authorised(interaction.user.id, interaction.channel_id):
+            await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            return
+        pid = attached_pids.get(self.channel_id)
+        if pid is None:
+            await interaction.response.send_message(
+                "Not attached anymore — can't reach the terminal.", ephemeral=True
+            )
+            return
+        await interaction.response.defer()
+        await _run_console_helper(pid, sequence, mode="keys")
+        sessions.audit(
+            self.channel_id, interaction.user.id, "tool_approval",
+            f"{self.tool_name}:{action_label}",
+        )
+        for child in self.children:
+            child.disabled = True
+        self.stop()
+        try:
+            await interaction.message.edit(
+                content=f"{interaction.message.content}\n→ **{action_label}** by <@{interaction.user.id}>",
+                view=self,
+            )
+        except discord.HTTPException:
+            pass
+
+    @discord.ui.button(label="Allow", style=discord.ButtonStyle.success, emoji="✅")
+    async def btn_allow(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self._send_keystroke(interaction, "1", "Allow")
+
+    @discord.ui.button(label="Deny", style=discord.ButtonStyle.danger, emoji="❌")
+    async def btn_deny(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        await self._send_keystroke(interaction, "2", "Deny")
+
+    @discord.ui.button(label="Deny + tell Claude…", style=discord.ButtonStyle.secondary, emoji="💬")
+    async def btn_deny_instruct(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if not _is_authorised(interaction.user.id, interaction.channel_id):
+            await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            return
+        if attached_pids.get(self.channel_id) is None:
+            await interaction.response.send_message(
+                "Not attached anymore — can't reach the terminal.", ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(DenyInstructModal(parent_view=self))
+
+
+# ---------- remote keypad (interactive TUI driver) --------------------------
+#
+# Discord buttons → key events into the attached terminal. Lets you navigate
+# Claude Code's pickers / popups without typing `!cc keys ...` each time.
+
+
+class RemoteKeypadView(discord.ui.View):
+    """3 × 5 grid: arrows, modifier keys, number keys for numbered popups, Look."""
+
+    def __init__(self, channel_id: int):
+        super().__init__(timeout=3600)
+        self.channel_id = channel_id
+
+    async def _send_key(self, interaction: discord.Interaction, key: str):
+        if not _is_authorised(interaction.user.id, interaction.channel_id):
+            await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            return
+        pid = attached_pids.get(self.channel_id)
+        if pid is None:
+            await interaction.response.send_message(
+                "Not attached anymore — `!cc attach` first.", ephemeral=True
+            )
+            return
+        await interaction.response.defer()
+        await _run_console_helper(pid, key, mode="keys")
+        sessions.audit(self.channel_id, interaction.user.id, "keypad", key)
+
+    async def _snapshot(self, interaction: discord.Interaction):
+        if not _is_authorised(interaction.user.id, interaction.channel_id):
+            await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            return
+        pid = attached_pids.get(self.channel_id)
+        if pid is None:
+            await interaction.response.send_message(
+                "Not attached anymore.", ephemeral=True
+            )
+            return
+        await interaction.response.defer(thinking=True)
+        screen = await _run_console_helper(pid, "", mode="look")
+        body = screen[-3500:] if screen.strip() else "_(screen empty)_"
+        await interaction.followup.send(f"```\n{body}\n```")
+
+    # Row 0 — top: ↑, modifier keys, Look
+    @discord.ui.button(emoji="⬆️", style=discord.ButtonStyle.primary, row=0)
+    async def k_up(self, i: discord.Interaction, _b): await self._send_key(i, "up")
+
+    @discord.ui.button(label="Esc", style=discord.ButtonStyle.secondary, row=0)
+    async def k_esc(self, i: discord.Interaction, _b): await self._send_key(i, "esc")
+
+    @discord.ui.button(label="Tab", style=discord.ButtonStyle.secondary, row=0)
+    async def k_tab(self, i: discord.Interaction, _b): await self._send_key(i, "tab")
+
+    @discord.ui.button(label="Bksp", style=discord.ButtonStyle.secondary, row=0)
+    async def k_bksp(self, i: discord.Interaction, _b): await self._send_key(i, "backspace")
+
+    @discord.ui.button(emoji="👁", label="Look", style=discord.ButtonStyle.success, row=0)
+    async def k_look(self, i: discord.Interaction, _b): await self._snapshot(i)
+
+    # Row 1 — bottom row: ←, ↓, →, Enter, Space
+    @discord.ui.button(emoji="⬅️", style=discord.ButtonStyle.primary, row=1)
+    async def k_left(self, i: discord.Interaction, _b): await self._send_key(i, "left")
+
+    @discord.ui.button(emoji="⬇️", style=discord.ButtonStyle.primary, row=1)
+    async def k_down(self, i: discord.Interaction, _b): await self._send_key(i, "down")
+
+    @discord.ui.button(emoji="➡️", style=discord.ButtonStyle.primary, row=1)
+    async def k_right(self, i: discord.Interaction, _b): await self._send_key(i, "right")
+
+    @discord.ui.button(label="Enter", emoji="⏎", style=discord.ButtonStyle.success, row=1)
+    async def k_enter(self, i: discord.Interaction, _b): await self._send_key(i, "enter")
+
+    @discord.ui.button(label="Space", style=discord.ButtonStyle.secondary, row=1)
+    async def k_space(self, i: discord.Interaction, _b): await self._send_key(i, "space")
+
+    # Row 2 — number keys (Claude Code popups use 1/2/3/…)
+    @discord.ui.button(label="1", style=discord.ButtonStyle.secondary, row=2)
+    async def k_1(self, i: discord.Interaction, _b): await self._send_key(i, "1")
+
+    @discord.ui.button(label="2", style=discord.ButtonStyle.secondary, row=2)
+    async def k_2(self, i: discord.Interaction, _b): await self._send_key(i, "2")
+
+    @discord.ui.button(label="3", style=discord.ButtonStyle.secondary, row=2)
+    async def k_3(self, i: discord.Interaction, _b): await self._send_key(i, "3")
+
+    @discord.ui.button(label="4", style=discord.ButtonStyle.secondary, row=2)
+    async def k_4(self, i: discord.Interaction, _b): await self._send_key(i, "4")
+
+    @discord.ui.button(label="5", style=discord.ButtonStyle.secondary, row=2)
+    async def k_5(self, i: discord.Interaction, _b): await self._send_key(i, "5")
+
+
+async def cmd_pad(channel, channel_id):
+    pid = attached_pids.get(channel_id)
+    if pid is None:
+        await channel.send("Not attached. `!cc attach <name>` first.")
+        return
+    view = RemoteKeypadView(channel_id)
+    msg = await channel.send(
+        "⌨️ **Remote keypad** — tap to send keys to the attached terminal. "
+        "Lives for 1 hour, then run `!cc pad` again.",
+        view=view,
+    )
+    view.message = msg
 
 
 async def cmd_resume(channel, channel_id, user_id, prefix: str):
@@ -654,6 +885,10 @@ async def cmd_launch(channel, user_id: int, args: str):
         )
         return
 
+    # Pre-claim so the auto-spawn watcher doesn't create a duplicate hex-id channel
+    # during the ~5-10 s it takes us to finish trust prompt + /rename + attach.
+    _auto_spawn_seen.add(new_pid)
+
     # Give the trust prompt a moment to render, then accept it with Enter.
     await asyncio.sleep(2)
     await _run_console_helper(new_pid, "", mode="enter")
@@ -801,6 +1036,35 @@ async def cmd_esc(channel, channel_id):
         await channel.send("⎋ Escape sent.")
 
 
+async def cmd_keys(channel, channel_id, user_id, sequence: str):
+    """Raw passthrough: send a comma-separated key sequence to the attached terminal.
+
+    Examples:
+      !cc keys 1                       → number-key approval response
+      !cc keys down,down,enter         → navigate a picker
+      !cc keys space,tab,y,enter       → toggle a checkbox, jump to field, confirm
+
+    Recognised tokens: enter, esc, up, down, left, right, tab, space, backspace,
+    plus any single printable character.
+    """
+    if not sequence:
+        await channel.send(
+            "Usage: `!cc keys <comma-separated>` e.g. `!cc keys down,down,enter`"
+        )
+        return
+    pid = attached_pids.get(channel_id)
+    if pid is None:
+        await channel.send("Not attached. `!cc attach <name>` first.")
+        return
+    async with channel.typing():
+        result = await _run_console_helper(pid, sequence, mode="keys")
+    sessions.audit(channel_id, user_id, "keys", sequence)
+    if "failed" in result.lower() or "unknown key" in result.lower():
+        await channel.send(f"⚠️ `{result.strip()}`")
+    else:
+        await channel.send(f"⌨️ Sent: `{sequence}`")
+
+
 async def _render_piece(channel, kind: str, data: dict, pending_tools: Dict[str, tuple]):
     """Render one parsed JSONL piece into Discord, pairing tools with their results."""
     if kind == "text":
@@ -846,6 +1110,12 @@ async def _mirror_loop(channel, channel_id: int, user_id: int, jsonl_path: Path,
     pending_tools: Dict[str, tuple] = {}
     pending_tool_ids: set = set()
     resolved_tool_ids: set = set()
+    # Tool-approval tracking: when did each non-readonly tool_use first appear,
+    # and which ones have we already surfaced a Discord approval embed for?
+    approval_emit_at: Dict[str, float] = {}            # tool_id → t_first_seen
+    approval_meta: Dict[str, tuple] = {}               # tool_id → (name, input)
+    surfaced_approvals: Dict[str, tuple] = {}          # tool_id → (msg, view)
+    APPROVAL_DELAY = 3.0  # seconds before assuming a popup is waiting
     parsed_to = start_offset
     last_size = start_offset
     last_change = time.time()
@@ -888,14 +1158,35 @@ async def _mirror_loop(channel, channel_id: int, user_id: int, jsonl_path: Path,
                         for block in content:
                             if isinstance(block, dict) and block.get("type") == "tool_use":
                                 tid = block.get("id")
+                                tname = block.get("name", "?")
                                 if tid:
                                     pending_tool_ids.add(tid)
+                                    # Only non-readonly tools trigger Claude Code's
+                                    # approval popup; readonly ones run silently.
+                                    if tname not in READ_ONLY_TOOLS:
+                                        approval_emit_at[tid] = time.time()
+                                        approval_meta[tid] = (tname, block.get("input", {}))
                     elif t == "user":
                         for block in content:
                             if isinstance(block, dict) and block.get("type") == "tool_result":
                                 tid = block.get("tool_use_id")
                                 if tid:
                                     resolved_tool_ids.add(tid)
+                                    # Tool resolved: close out any approval embed we surfaced.
+                                    if tid in surfaced_approvals:
+                                        appr_msg, appr_view = surfaced_approvals.pop(tid)
+                                        for child in appr_view.children:
+                                            child.disabled = True
+                                        appr_view.stop()
+                                        try:
+                                            await appr_msg.edit(
+                                                content=f"{appr_msg.content}\n→ _Resolved._",
+                                                view=appr_view,
+                                            )
+                                        except discord.HTTPException:
+                                            pass
+                                    approval_emit_at.pop(tid, None)
+                                    approval_meta.pop(tid, None)
 
                 pieces = extract_user_facing(new_objs)
                 for kind, data in pieces:
@@ -903,6 +1194,28 @@ async def _mirror_loop(channel, channel_id: int, user_id: int, jsonl_path: Path,
                     if kind == "text":
                         last_assistant_at = time.time()
                         pinged_for_turn = False
+
+            # Surface a Discord approval embed for any non-readonly tool_use
+            # that's been unresolved past APPROVAL_DELAY — that timing almost
+            # always means Claude Code is showing a TUI approval popup.
+            now = time.time()
+            for tid, emit_ts in list(approval_emit_at.items()):
+                if tid in resolved_tool_ids or tid in surfaced_approvals:
+                    continue
+                if now - emit_ts < APPROVAL_DELAY:
+                    continue
+                tname, tinput = approval_meta.get(tid, ("?", {}))
+                preview = _format_tool_input(tname, tinput)
+                view = ToolApprovalView(channel_id, tid, tname)
+                try:
+                    sent = await channel.send(
+                        f"🛑 <@{user_id}> **{tname}** wants approval — {preview}",
+                        view=view,
+                    )
+                    view.message = sent
+                    surfaced_approvals[tid] = (sent, view)
+                except discord.HTTPException as e:
+                    print(f"  approval embed send failed for {tid}: {e}")
 
             if cur_size != last_size:
                 last_size = cur_size
@@ -1032,6 +1345,7 @@ async def cmd_ask(channel, channel_id, user_id, prompt: str):
 COMMANDS = {
     "help", "status", "where", "new", "cancel", "live", "detach", "look",
     "close", "cd", "sessions", "resume", "attach", "spawn", "launch", "usage", "esc",
+    "keys", "pad",
 }
 
 
@@ -1089,6 +1403,10 @@ async def dispatch(channel, channel_id: int, user_id: int, text: str):
             await cmd_launch(channel, user_id, tail)
         elif head == "usage":
             await cmd_usage(channel)
+        elif head == "keys":
+            await cmd_keys(channel, channel_id, user_id, tail)
+        elif head == "pad":
+            await cmd_pad(channel, channel_id)
         return
 
     # First word isn't a command — treat the whole thing as a prompt.
