@@ -53,7 +53,8 @@ HELP_TEXT = (
     f"`{PREFIX} launch <name> [cwd]` — start a *brand-new* terminal, name it, attach a channel\n"
     f"`{PREFIX} spawn <name>` — attach a new channel to an *existing* running terminal\n"
     f"`{PREFIX} close [name]` — detach, **kill the terminal window**, delete the channel\n"
-    f"`{PREFIX} cleanup` — sweep orphan PowerShell windows from past `/exit`s\n\n"
+    f"`{PREFIX} cleanup` — sweep orphan PowerShell windows from past `/exit`s\n"
+    f"`{PREFIX} sweep` — delete orphan hex-id Discord channels (no live claude.exe)\n\n"
     f"**Per-channel attach** (manual):\n"
     f"`{PREFIX} live` — list running Claude Code processes\n"
     f"`{PREFIX} attach <name>` — drive that terminal from this channel\n"
@@ -1095,6 +1096,60 @@ async def cmd_close(channel, channel_id, user_id, name: str = ""):
         await channel.send(f"⚠️ Couldn't delete channel: {e}")
 
 
+async def cmd_sweep_channels(channel):
+    """Delete bot-created hex-id channels whose claude.exe is gone."""
+    if not channel.guild:
+        await channel.send("Can only sweep inside a server.")
+        return
+    hex_re = re.compile(r"^[0-9a-f]{8}$")
+    live_prefixes = {c.session_id[:8].lower() for c in list_running()}
+    candidates = [
+        ch for ch in channel.guild.text_channels
+        if hex_re.match(ch.name) and ch.id not in CONTROL_CHANNELS
+    ]
+    if not candidates:
+        await channel.send("🧹 No hex-id channels found.")
+        return
+
+    killed: list[str] = []
+    skipped: list[str] = []
+    for ch in candidates:
+        if ch.name.lower() in live_prefixes:
+            skipped.append(ch.name)
+            continue
+        try:
+            await ch.delete(reason="cc-discord-remote: orphan hex-id channel sweep")
+            sessions.conn.execute("DELETE FROM sessions WHERE channel_id = ?", (ch.id,))
+            ALLOWED_CHANNELS.discard(ch.id)
+            attached_pids.pop(ch.id, None)
+            killed.append(ch.name)
+        except discord.Forbidden:
+            await channel.send(
+                f"⚠️ Missing Manage Channels permission — can't delete `#{ch.name}`."
+            )
+            return
+        except discord.HTTPException as e:
+            print(f"  couldn't delete #{ch.name}: {e}")
+    sessions.conn.commit()
+
+    lines = []
+    if killed:
+        s = "s" if len(killed) > 1 else ""
+        lines.append(
+            f"🧹 Deleted **{len(killed)}** orphan hex channel{s}: "
+            + ", ".join(f"`#{n}`" for n in killed)
+        )
+    if skipped:
+        s = "s" if len(skipped) > 1 else ""
+        lines.append(
+            f"Kept **{len(skipped)}** hex channel{s} with a live claude.exe: "
+            + ", ".join(f"`#{n}`" for n in skipped)
+        )
+    if not killed and not skipped:
+        lines.append("Nothing to clean.")
+    await channel.send("\n".join(lines))
+
+
 async def cmd_cleanup(channel):
     """Sweep up orphan PowerShell windows whose `claude` invocation has already exited."""
     # Match cmd_launch / cmd_resume_spawn's launch pattern, and exclude `$PID`
@@ -1565,7 +1620,7 @@ async def cmd_ask(channel, channel_id, user_id, prompt: str):
 COMMANDS = {
     "help", "status", "where", "new", "cancel", "live", "detach", "look",
     "close", "cd", "sessions", "resume", "attach", "spawn", "launch", "usage", "esc",
-    "keys", "pad", "cleanup",
+    "keys", "pad", "cleanup", "sweep",
 }
 
 
@@ -1629,6 +1684,8 @@ async def dispatch(channel, channel_id: int, user_id: int, text: str):
             await cmd_pad(channel, channel_id)
         elif head == "cleanup":
             await cmd_cleanup(channel)
+        elif head == "sweep":
+            await cmd_sweep_channels(channel)
         return
 
     # First word isn't a command — treat the whole thing as a prompt.
@@ -1736,6 +1793,12 @@ async def _auto_spawn_watcher(interval: float = 15.0):
 
             for info in new_sessions:
                 _auto_spawn_seen.add(info.pid)
+                # Recheck right before we create the Discord channel: a parallel
+                # cmd_launch / cmd_resume_spawn may have claimed this PID between
+                # the snapshot above and now. Skip if so, otherwise we leak a
+                # hex-id orphan channel.
+                if info.pid in attached_pids.values():
+                    continue
                 channel_name = _sanitize_channel_name(info.name or info.session_id[:8])
                 try:
                     new_chan = await guild.create_text_channel(name=channel_name)
