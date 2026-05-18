@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -351,9 +352,48 @@ class ResumePickerView(discord.ui.View):
 # ---------- tool-approval bridge (attached-terminal mode) -------------------
 #
 # When Claude Code runs in a real terminal, tool-approval popups are TUI-only —
-# no `can_use_tool` callback. We detect them via timing: a non-readonly tool_use
-# that's been unresolved for ≥3 s probably has a popup waiting. Surface buttons
-# that drive the popup with number keys via `console_helper.py keys`.
+# no `can_use_tool` callback. Detection is two-stage so we don't post useless
+# buttons for auto-approved-but-slow tools (e.g. WebSearch can take 5-10 s):
+#   1. timing: tool_use unresolved for ≥APPROVAL_DELAY
+#   2. screen-read: the terminal actually shows an approval popup right now
+# Only when both fire do we surface the Discord embed.
+
+
+# Heuristic signatures for Claude Code's approval popup. console_helper reads
+# only the visible window (not scrollback), so old dialogs in history won't
+# match — these patterns reflect the live screen state.
+_APPROVAL_POPUP_SIGNATURES = (
+    re.compile(r"Do you want to (?:allow|run|continue|proceed|edit|create|delete)", re.I),
+    re.compile(r"^\s*[▶❯>]\s*\d+[.):]\s", re.M),  # cursored numbered option
+    re.compile(r"^\s*1\.\s*(?:Yes|Allow)", re.I | re.M),
+)
+
+
+def _screen_shows_approval_popup(screen: str) -> bool:
+    if not screen or not screen.strip():
+        return False
+    return any(sig.search(screen) for sig in _APPROVAL_POPUP_SIGNATURES)
+
+
+# Indicators that the visible screen has something the user can navigate
+# (picker cursor, checkboxes, or a numbered selection list). Used after a
+# slash command to decide whether to auto-attach a keypad to the snapshot.
+_NAVIGABLE_CURSOR_RE = re.compile(r"^\s*[▶❯▷]\s+\S", re.M)
+_NAVIGABLE_CHECKBOX_RE = re.compile(r"[(\[][√✓✗x• ][)\]]", re.I)
+_NAVIGABLE_NUMBERED_RE = re.compile(r"^\s+\d+[.):]\s+\S", re.M)
+
+
+def _screen_looks_navigable(screen: str) -> bool:
+    """Heuristic: is there an interactive picker/menu on the screen right now?"""
+    if not screen or not screen.strip():
+        return False
+    # Only consider the last ~30 lines so old scrollback indicators don't trip us.
+    tail = "\n".join(screen.splitlines()[-30:])
+    return bool(
+        _NAVIGABLE_CURSOR_RE.search(tail)
+        or _NAVIGABLE_CHECKBOX_RE.search(tail)
+        or _NAVIGABLE_NUMBERED_RE.search(tail)
+    )
 
 
 class DenyInstructModal(discord.ui.Modal, title="Tell Claude what to do differently"):
@@ -1228,12 +1268,14 @@ async def _mirror_loop(channel, channel_id: int, user_id: int, jsonl_path: Path,
     pending_tools: Dict[str, tuple] = {}
     pending_tool_ids: set = set()
     resolved_tool_ids: set = set()
-    # Tool-approval tracking: when did each non-readonly tool_use first appear,
-    # and which ones have we already surfaced a Discord approval embed for?
+    # Tool-approval tracking: per-tool emit time, surfacing state, and the set of
+    # tool_ids we already screen-checked (and decided no popup was visible) so we
+    # don't re-poll the terminal every mirror tick.
     approval_emit_at: Dict[str, float] = {}            # tool_id → t_first_seen
     approval_meta: Dict[str, tuple] = {}               # tool_id → (name, input)
     surfaced_approvals: Dict[str, tuple] = {}          # tool_id → (msg, view)
-    APPROVAL_DELAY = 3.0  # seconds before assuming a popup is waiting
+    approval_no_popup: set = set()                     # tool_ids already screen-checked, no popup
+    APPROVAL_DELAY = 4.0  # seconds before screen-check (was 3.0 — too aggressive)
     parsed_to = start_offset
     last_size = start_offset
     last_change = time.time()
@@ -1305,6 +1347,7 @@ async def _mirror_loop(channel, channel_id: int, user_id: int, jsonl_path: Path,
                                             pass
                                     approval_emit_at.pop(tid, None)
                                     approval_meta.pop(tid, None)
+                                    approval_no_popup.discard(tid)
 
                 pieces = extract_user_facing(new_objs)
                 for kind, data in pieces:
@@ -1313,14 +1356,28 @@ async def _mirror_loop(channel, channel_id: int, user_id: int, jsonl_path: Path,
                         last_assistant_at = time.time()
                         pinged_for_turn = False
 
-            # Surface a Discord approval embed for any non-readonly tool_use
-            # that's been unresolved past APPROVAL_DELAY — that timing almost
-            # always means Claude Code is showing a TUI approval popup.
+            # Two-stage approval surfacing: timing AND a screen-check. Many tools
+            # (WebSearch, WebFetch on permissive configs) auto-approve but still
+            # take 5-10 s to resolve. The timing heuristic alone would flood the
+            # channel with useless approval embeds for those.
             now = time.time()
             for tid, emit_ts in list(approval_emit_at.items()):
                 if tid in resolved_tool_ids or tid in surfaced_approvals:
                     continue
+                if tid in approval_no_popup:
+                    continue
                 if now - emit_ts < APPROVAL_DELAY:
+                    continue
+                pid_for_screen = attached_pids.get(channel_id)
+                if pid_for_screen is None:
+                    # No PID to query — surface anyway; better to over-prompt than miss.
+                    screen = ""
+                    popup_visible = True
+                else:
+                    screen = await _run_console_helper(pid_for_screen, "", mode="look")
+                    popup_visible = _screen_shows_approval_popup(screen)
+                if not popup_visible:
+                    approval_no_popup.add(tid)
                     continue
                 tname, tinput = approval_meta.get(tid, ("?", {}))
                 preview = _format_tool_input(tname, tinput)
@@ -1381,21 +1438,32 @@ async def cmd_terminal_send(channel, channel_id, user_id, text: str):
             mt.cancel()
         return True
 
+    # Slash commands are TUI-only (no JSONL writes). Use mode="send" so the
+    # helper types AND polls the screen until it's been stable for ~1.5 s —
+    # much more reliable than a fixed delay, especially for commands that need
+    # a network roundtrip (e.g. /login) or render an interactive picker.
+    is_slash = text.lstrip().startswith("/")
+    mode = "send" if is_slash else "type"
+
     async with channel.typing():
-        ack = await _run_console_helper(pid, text, mode="type")
-    if "AttachConsole" in ack and "failed" in ack:
-        await channel.send(f"⚠️ {ack.strip()}")
+        result = await _run_console_helper(pid, text, mode=mode)
+
+    if "AttachConsole" in result and "failed" in result:
+        await channel.send(f"⚠️ {result.strip()}")
         return True
 
-    # Slash commands are TUI-only — they don't write to the JSONL, so the mirror
-    # loop never picks them up. Auto-snapshot the screen so the user can see
-    # what the command produced (popup, picker, dialog, etc.).
-    if text.lstrip().startswith("/"):
-        async with channel.typing():
-            await asyncio.sleep(1.5)
-            screen = await _run_console_helper(pid, "", mode="look")
-        body = screen[-3500:] if screen.strip() else "_(screen empty)_"
-        await send_chunked(channel, f"```\n{body}\n```")
+    if is_slash:
+        # Trim to fit in a single Discord message so we can attach a keypad
+        # view if the screen looks navigable (a picker/menu opened).
+        body = result[-1800:] if result.strip() else "_(screen empty)_"
+        formatted = f"```\n{body}\n```"
+        if _screen_looks_navigable(result):
+            view = RemoteKeypadView(channel_id)
+            view.timeout = 600  # 10 min for auto-attached pads vs 1 h manual
+            msg = await channel.send(formatted, view=view)
+            view.message = msg
+        else:
+            await send_chunked(channel, formatted)
     return True
 
 
