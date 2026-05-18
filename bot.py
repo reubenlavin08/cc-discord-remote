@@ -169,30 +169,195 @@ async def cmd_sessions(channel, count: int = 10):
     await send_chunked(channel, "\n".join(lines))
 
 
-async def cmd_resume(channel, channel_id, user_id, prefix: str):
-    if not prefix:
-        await channel.send(f"Usage: `resume <id>`. Run `{PREFIX} sessions` to list options.")
-        return
-    s = find_by_prefix(prefix)
-    if not s:
-        await channel.send(
-            f"No session matches `{prefix}`. Run `{PREFIX} sessions` to see options."
-        )
-        return
+def _attach_resumed_sdk(channel_id: int, user_id: int, s) -> str:
+    """SDK-mode fallback: persist resume selection on the current channel. Returns reply text."""
     live = find_live_session(s.session_id)
+    warn = ""
     if live:
-        await channel.send(
-            f"⚠️ **Session is live in a terminal** (PID {live['pid']}, status `{live.get('status','?')}`).\n"
-            f"Close that Claude Code window before continuing, or Discord and the terminal will both write to "
-            f"the same file and corrupt it. Attaching anyway — proceed with care."
+        warn = (
+            f"⚠️ Session is live in a terminal (PID {live['pid']}, status "
+            f"`{live.get('status','?')}`). Close that window or Discord and the "
+            f"terminal will both write to the same JSONL.\n"
         )
     sessions.set_both(channel_id, s.session_id, s.cwd)
     sessions.audit(channel_id, user_id, "resume", s.session_id)
     headline = s.custom_name if s.custom_name else s.first_prompt
     tag = "📌 " if s.custom_name else ""
-    await channel.send(
-        f"Attached to `{s.session_id[:8]}` in `{s.cwd}`.\n> {tag}{(headline or '')[:160]}"
+    return (
+        f"{warn}Attached to `{s.session_id[:8]}` in `{s.cwd}`.\n"
+        f"> {tag}{(headline or '')[:160]}"
     )
+
+
+def _list_claude_pids() -> set:
+    """All running claude.exe PIDs via tasklist."""
+    try:
+        proc = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq claude.exe", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return set()
+    pids = set()
+    for line in proc.stdout.splitlines():
+        parts = [p.strip().strip('"') for p in line.split(",")]
+        if len(parts) >= 2 and parts[1].isdigit():
+            pids.add(int(parts[1]))
+    return pids
+
+
+async def cmd_resume_spawn(channel, user_id: int, s):
+    """Spawn `claude --resume <id>` in a new console, make a new Discord channel, attach it."""
+    if not channel.guild:
+        await channel.send(_attach_resumed_sdk(channel.id, user_id, s))
+        return
+
+    cwd = s.cwd
+    if cwd in (None, "", "?") or not Path(cwd).is_dir():
+        await channel.send(
+            f"⚠️ Session's cwd `{cwd}` doesn't exist on this machine — can't resume here."
+        )
+        return
+
+    sessions_dir = Path.home() / ".claude" / "sessions"
+    before_pids = _list_claude_pids()
+
+    short = s.session_id[:8]
+    await channel.send(f"🚀 Resuming `{short}` in `{cwd}`…")
+
+    try:
+        subprocess.Popen(
+            ["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-Command",
+             f"claude --resume {s.session_id}"],
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
+            cwd=cwd,
+            close_fds=True,
+        )
+    except Exception as e:
+        await channel.send(f"⚠️ Couldn't launch: `{type(e).__name__}: {e}`")
+        return
+
+    new_pid: Optional[int] = None
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        await asyncio.sleep(1)
+        diff = _list_claude_pids() - before_pids
+        if diff:
+            new_pid = max(diff)
+            break
+
+    if not new_pid:
+        await channel.send("⚠️ PowerShell window opened but no claude.exe appeared.")
+        return
+
+    # Defensive Enter in case a trust prompt rendered.
+    await asyncio.sleep(2)
+    await _run_console_helper(new_pid, "", mode="enter")
+
+    # Wait for the session JSON — this will hold the NEW forked session_id Claude assigned.
+    session_deadline = time.time() + 30
+    while time.time() < session_deadline:
+        await asyncio.sleep(0.5)
+        if (sessions_dir / f"{new_pid}.json").is_file():
+            break
+    else:
+        await channel.send(
+            f"⚠️ PID {new_pid} started but no session JSON appeared within 30s. "
+            f"Trust prompt may still be open — try `!cc attach {new_pid}` then `!cc esc`."
+        )
+        return
+
+    raw_name = s.custom_name or s.first_prompt or short
+    sanitized = _sanitize_channel_name(raw_name)
+    try:
+        new_chan = await channel.guild.create_text_channel(name=sanitized)
+    except discord.Forbidden:
+        await channel.send(
+            "⚠️ Terminal up but can't make a channel — bot needs **Manage Channels**."
+        )
+        return
+    except discord.HTTPException as e:
+        await channel.send(f"⚠️ Couldn't create channel: {e}")
+        return
+
+    ALLOWED_CHANNELS.add(new_chan.id)
+    await cmd_attach(new_chan, new_chan.id, user_id, str(new_pid))
+    await channel.send(f"📡 Resumed `{short}` (PID {new_pid}) in <#{new_chan.id}>.")
+
+
+class ResumeSelect(discord.ui.Select):
+    def __init__(self, summaries):
+        options = []
+        for s in summaries[:25]:
+            short = s.session_id[:8]
+            raw = (s.custom_name or s.first_prompt or "(empty)").replace("\n", " ").strip()
+            label = (raw[:97] + "…") if len(raw) > 100 else (raw or "(empty)")
+            desc = f"{short} · {s.cwd} · {format_age(s.mtime)}"
+            if len(desc) > 100:
+                desc = desc[:99] + "…"
+            live = find_live_session(s.session_id)
+            emoji = "🔴" if live else ("📌" if s.custom_name else None)
+            options.append(discord.SelectOption(
+                label=label,
+                value=s.session_id,
+                description=desc,
+                emoji=emoji,
+            ))
+        super().__init__(
+            placeholder="Pick a session to resume…",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if not _is_authorised(interaction.user.id, interaction.channel_id):
+            await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            return
+        session_id = self.values[0]
+        s = find_by_prefix(session_id)
+        if not s:
+            await interaction.response.send_message(
+                f"Session `{session_id[:8]}` not found anymore.", ephemeral=True
+            )
+            return
+        # Spawning a terminal can take 5-30 s, well past Discord's 3 s ack window.
+        await interaction.response.defer()
+        self.disabled = True
+        self.placeholder = f"Resuming {s.session_id[:8]}…"
+        if self.view is not None:
+            self.view.stop()
+            try:
+                await interaction.message.edit(view=self.view)
+            except discord.HTTPException:
+                pass
+        await cmd_resume_spawn(interaction.channel, interaction.user.id, s)
+
+
+class ResumePickerView(discord.ui.View):
+    def __init__(self, summaries):
+        super().__init__(timeout=180)
+        self.add_item(ResumeSelect(summaries))
+
+
+async def cmd_resume(channel, channel_id, user_id, prefix: str):
+    if not prefix:
+        summaries = list_recent_sessions(limit=25)
+        if not summaries:
+            await channel.send("No Claude Code sessions found on disk.")
+            return
+        await channel.send(
+            "**Pick a session to resume:**",
+            view=ResumePickerView(summaries),
+        )
+        return
+    s = find_by_prefix(prefix)
+    if not s:
+        await channel.send(
+            f"No session matches `{prefix}`. Run `{PREFIX} resume` (no id) for a picker."
+        )
+        return
+    await cmd_resume_spawn(channel, user_id, s)
 
 
 async def cmd_cancel(channel, channel_id):
