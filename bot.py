@@ -581,7 +581,7 @@ class RemoteKeypadView(discord.ui.View):
     @discord.ui.button(label="Bksp", style=discord.ButtonStyle.secondary, row=0)
     async def k_bksp(self, i: discord.Interaction, _b): await self._send_key(i, "backspace")
 
-    @discord.ui.button(emoji="👁", label="Look", style=discord.ButtonStyle.success, row=0)
+    @discord.ui.button(label="👁 Look", style=discord.ButtonStyle.success, row=0)
     async def k_look(self, i: discord.Interaction, _b): await self._snapshot(i)
 
     # Row 1 — bottom row: ←, ↓, →, Enter, Space
@@ -594,7 +594,7 @@ class RemoteKeypadView(discord.ui.View):
     @discord.ui.button(emoji="➡️", style=discord.ButtonStyle.primary, row=1)
     async def k_right(self, i: discord.Interaction, _b): await self._send_key(i, "right")
 
-    @discord.ui.button(label="Enter", emoji="⏎", style=discord.ButtonStyle.success, row=1)
+    @discord.ui.button(label="Enter ↵", style=discord.ButtonStyle.success, row=1)
     async def k_enter(self, i: discord.Interaction, _b): await self._send_key(i, "enter")
 
     @discord.ui.button(label="Space", style=discord.ButtonStyle.secondary, row=1)
