@@ -1699,6 +1699,7 @@ async def dispatch(channel, channel_id: int, user_id: int, text: str):
 
 _pid_watcher_started = False
 _auto_spawn_watcher_started = False
+_orphan_sweeper_started = False
 _auto_spawn_seen: set = set()  # PIDs we've already processed — populated on first poll
 
 
@@ -1744,6 +1745,56 @@ async def _pid_watcher(interval: float = 15.0):
             raise
         except Exception as e:
             print(f"  _pid_watcher error (continuing): {e}")
+
+
+async def _orphan_channel_sweeper(interval: float = 60.0):
+    """Background equivalent of `!cc sweep`: every minute, delete hex-id channels
+    whose 8-char prefix doesn't match a live claude.exe.
+
+    Catches the orphans that slip past `_pid_watcher` because they were never
+    inserted into the `sessions` DB (auto-spawn watcher creates the Discord
+    channel but `cmd_attach` refused with "already attached elsewhere"). Without
+    this, hex-id orphans pile up forever in the sidebar.
+    """
+    hex_re = re.compile(r"^[0-9a-f]{8}$")
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            live_prefixes = {c.session_id[:8].lower() for c in list_running()}
+
+            guilds_to_check = set()
+            for cid in CONTROL_CHANNELS:
+                ch = bot.get_channel(cid)
+                if ch and getattr(ch, "guild", None):
+                    guilds_to_check.add(ch.guild)
+
+            for guild in guilds_to_check:
+                for ch in guild.text_channels:
+                    if ch.id in CONTROL_CHANNELS:
+                        continue
+                    if not hex_re.match(ch.name):
+                        continue
+                    if ch.name.lower() in live_prefixes:
+                        continue
+                    try:
+                        await ch.delete(
+                            reason="cc-discord-remote: orphan hex-id channel auto-sweep"
+                        )
+                        sessions.conn.execute(
+                            "DELETE FROM sessions WHERE channel_id = ?", (ch.id,)
+                        )
+                        ALLOWED_CHANNELS.discard(ch.id)
+                        attached_pids.pop(ch.id, None)
+                        sessions.conn.commit()
+                        print(f"  auto-swept orphan channel #{ch.name}")
+                    except discord.Forbidden:
+                        pass
+                    except discord.HTTPException as e:
+                        print(f"  couldn't auto-sweep #{ch.name}: {e}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"  _orphan_channel_sweeper error (continuing): {e}")
 
 
 async def _auto_spawn_watcher(interval: float = 15.0):
@@ -1897,13 +1948,16 @@ async def on_ready():
     sessions.conn.commit()
 
     # Sync slash commands to each guild the allowed channels live in (instant per-guild).
-    global _pid_watcher_started, _auto_spawn_watcher_started
+    global _pid_watcher_started, _auto_spawn_watcher_started, _orphan_sweeper_started
     if not _pid_watcher_started:
         _pid_watcher_started = True
         asyncio.create_task(_pid_watcher())
     if not _auto_spawn_watcher_started:
         _auto_spawn_watcher_started = True
         asyncio.create_task(_auto_spawn_watcher())
+    if not _orphan_sweeper_started:
+        _orphan_sweeper_started = True
+        asyncio.create_task(_orphan_channel_sweeper())
 
     synced_guilds = set()
     for chan_id in ALLOWED_CHANNELS:
