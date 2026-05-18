@@ -17,8 +17,9 @@ Drive [Claude Code](https://claude.com/claude-code) running in a terminal on you
 
 - **True live-attach**, not screen-scraping — `AttachConsole` + `WriteConsoleInput` against any running `claude.exe`
 - **Bidirectional mirror** — terminal activity streams to Discord, Discord messages stream to the terminal
-- **Per-tool Discord button approvals** — Claude can't run `Edit`/`Write`/`Bash` until you tap Approve on your phone
-- **One Discord channel per terminal** — `!cc spawn compressedprompt` auto-creates `#compressedprompt`, attached and mirroring
+- **TUI menus → Discord components** — slash commands (`/powerup`, `/model`, `/agents`, `/resume`) auto-snapshot the screen with a clickable keypad attached. Tap a button → key fires into the terminal → same Discord message edits in place with the new screen
+- **Per-tool Discord button approvals** — both in SDK mode (`can_use_tool`) and in attached-terminal mode (screen-detected popup → Allow / Deny / Deny + tell Claude buttons, with a Modal for free-text reasoning)
+- **One Discord channel per terminal** — `!cc spawn <name>` auto-creates `#<name>`, attached and mirroring; `!cc close` kills the PowerShell window too, not just the channel
 - **Resilient** — channel↔terminal mappings persist in SQLite; bot restart restores every mirror
 - **Honest fallback** — when no live terminal exists for a session, headless Agent SDK takes over with the same JSONL format
 
@@ -50,16 +51,40 @@ Claude Code ships a built-in `/remote-control` feature, but it requires the phon
 
 ## Features
 
-- `!cc live` / `/cc live` — list running Claude Code processes by custom name
+**Multi-channel — one Discord channel per terminal:**
+- `!cc launch <name> [cwd]` — start a brand-new terminal, name it, attach a fresh channel
+- `!cc spawn <name>` — attach a new channel to an existing running terminal
+- `!cc close [name]` — detach, **kill the PowerShell window**, delete the channel
+- `!cc cleanup` — sweep orphan PowerShell windows from past `/exit`s
+
+**Per-channel attach:**
+- `!cc live` — list running Claude Code processes by custom name
 - `!cc attach <name>` — drive that terminal from this channel
-- `!cc <prompt>` — type into the attached terminal; receive Claude's reply via JSONL tail
-- `!cc look` — snapshot the terminal screen
 - `!cc detach` — disconnect
-- `!cc sessions` — list past sessions (including renamed ones with their `/rename` title)
-- `!cc resume <id>` — attach to a stored session; warns if it's currently live in a terminal
-- `!cc cancel` — interrupt a running headless turn
-- `!cc <prompt>` (when not attached) — spawn a headless Claude via Agent SDK
-- @mention pings on turns longer than 15s and on pending approvals
+- `!cc look` — snapshot the terminal screen
+- Anything typed in an attached channel (no prefix) is typed straight into the terminal
+
+**Driving Claude Code's TUI from Discord:**
+- `!cc pad` — pop a clickable keypad (arrows in inverted-T, Esc / Tab / Bksp / Enter / Space / 1-5 / Look). Each click sends one key and edits the message in place with the new screen
+- `!cc keys <seq>` — raw key passthrough (e.g. `!cc keys down,down,enter`)
+- Type any `/`-prefixed message in an attached channel → bot types it into the terminal, waits for the screen to stabilize, posts the snapshot with a keypad already attached for navigation
+- Tool-approval popups in attached terminals auto-surface as Discord buttons (`✅ Allow / ❌ Deny / 💬 Deny + tell Claude`); the third opens a Modal for free-text reasoning
+
+**Sessions:**
+- `!cc sessions` — list past sessions (renamed ones show their `/rename` title)
+- `!cc resume` (no arg) — dropdown picker of the 25 most-recent sessions; pick one and the bot spawns `claude --resume <id>` in a new terminal + new Discord channel
+- `!cc resume <id>` — same, by direct id
+
+**Headless SDK mode:**
+- `!cc <prompt>` (in a non-attached channel) — spawn a headless Claude via Agent SDK and stream the response
+- `!cc new` / `!cc cancel` / `!cc cd <path>` — manage SDK-mode session state
+- `!cc status` — show current cwd + session id
+- `!cc usage` — fetch usage stats from claude-monitor (model, context %, cost, 5h + weekly limits)
+
+**Quality of life:**
+- @mention pings on turns longer than 15 s and on pending approvals
+- SQLite audit log of every command (`sessions.db`)
+- Auto-spawn watcher: a fresh `claude` started in any terminal gets its own Discord channel within ~15 s
 
 ## Setup
 
