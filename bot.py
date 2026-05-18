@@ -51,7 +51,8 @@ HELP_TEXT = (
     f"**Multi-channel** — one Discord channel per terminal:\n"
     f"`{PREFIX} launch <name> [cwd]` — start a *brand-new* terminal, name it, attach a channel\n"
     f"`{PREFIX} spawn <name>` — attach a new channel to an *existing* running terminal\n"
-    f"`{PREFIX} close [name]` — detach + delete a channel (this one, or named)\n\n"
+    f"`{PREFIX} close [name]` — detach, **kill the terminal window**, delete the channel\n"
+    f"`{PREFIX} cleanup` — sweep orphan PowerShell windows from past `/exit`s\n\n"
     f"**Per-channel attach** (manual):\n"
     f"`{PREFIX} live` — list running Claude Code processes\n"
     f"`{PREFIX} attach <name>` — drive that terminal from this channel\n"
@@ -932,8 +933,51 @@ async def cmd_launch(channel, user_id: int, args: str):
     await channel.send(f"📡 New terminal `{name}` (PID {new_pid}) up in <#{new_chan.id}>.")
 
 
+def _get_parent_pid_sync(pid: int) -> Optional[int]:
+    """Best-effort parent-PID lookup via CIM. Returns None for dead pids or query failure."""
+    if not pid_alive(pid):
+        return None
+    try:
+        proc = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command",
+             f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').ParentProcessId"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+        )
+        s = proc.stdout.strip()
+        return int(s) if s.isdigit() else None
+    except Exception:
+        return None
+
+
+def _kill_tree(pid: int) -> bool:
+    """taskkill /T /F. Returns True if `pid` is dead afterwards."""
+    try:
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(pid)],
+            capture_output=True, text=True, timeout=10,
+        )
+    except Exception:
+        return False
+    time.sleep(0.3)  # give the OS a moment to actually tear down the tree
+    return not pid_alive(pid)
+
+
+async def _close_terminal_for_pid(pid: int) -> str:
+    """Kill the PowerShell window owning claude.exe `pid`. Returns user-facing status."""
+    if not pid_alive(pid):
+        return "claude.exe already exited — window may persist, try `!cc cleanup`"
+    ppid = _get_parent_pid_sync(pid)
+    if ppid:
+        if _kill_tree(ppid):
+            return f"closed terminal window (PowerShell PID {ppid})"
+        return f"sent kill to PowerShell {ppid} but it's still alive"
+    _kill_tree(pid)  # at least stop claude.exe from writing more JSONL
+    return f"killed claude.exe {pid}; PowerShell parent unknown — window may persist"
+
+
 async def cmd_close(channel, channel_id, user_id, name: str = ""):
-    """Detach (if attached) and delete a channel.
+    """Detach, kill the terminal window, and delete the Discord channel.
 
     `!cc close`         — close THIS channel.
     `!cc close <name>`  — close the channel matching <name> (resolved against
@@ -966,16 +1010,90 @@ async def cmd_close(channel, channel_id, user_id, name: str = ""):
         mt.cancel()
     sessions.set_attached_pid(target_id, None)
     ALLOWED_CHANNELS.discard(target_id)
+
+    kill_status = ""
+    if pid:
+        kill_status = await _close_terminal_for_pid(pid)
+
     try:
-        if target_id != channel_id:
-            await channel.send(f"🔌 Closing <#{target_id}> (was on PID {pid})…" if pid else f"🔌 Closing <#{target_id}>…")
-        else:
-            await channel.send(f"🔌 Closing (was on PID {pid})…" if pid else "🔌 Closing channel…")
+        scope = f"<#{target_id}>" if target_id != channel_id else "channel"
+        info_bits = []
+        if pid:
+            info_bits.append(f"PID {pid}")
+        if kill_status:
+            info_bits.append(kill_status)
+        suffix = f" — {' · '.join(info_bits)}" if info_bits else ""
+        await channel.send(f"🔌 Closing {scope}{suffix}")
         await target.delete()
     except discord.Forbidden:
         await channel.send("⚠️ Bot needs **Manage Channels** to delete that channel.")
     except discord.HTTPException as e:
         await channel.send(f"⚠️ Couldn't delete channel: {e}")
+
+
+async def cmd_cleanup(channel):
+    """Sweep up orphan PowerShell windows whose `claude` invocation has already exited."""
+    # Match cmd_launch / cmd_resume_spawn's launch pattern, and exclude `$PID`
+    # (the running query process — it always self-matches because its argument
+    # literal contains the pattern string).
+    LAUNCH_MARKER = "-NoExit -ExecutionPolicy Bypass -Command claude"
+    proc = await _asyncio.create_subprocess_exec(
+        "powershell.exe", "-NoProfile", "-Command",
+        "Get-CimInstance Win32_Process -Filter \"Name='powershell.exe'\" | "
+        "Where-Object { $_.ProcessId -ne $PID -and "
+        f"$_.CommandLine -like '*{LAUNCH_MARKER}*' }} | "
+        "ForEach-Object { @{ Pid = $_.ProcessId } } | "
+        "ConvertTo-Json -Compress",
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+        creationflags=0x08000000,
+    )
+    out, _ = await proc.communicate()
+    raw = out.decode("utf-8", errors="replace").strip()
+    if not raw:
+        await channel.send("🧹 No claude-launched PowerShell windows found.")
+        return
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        await channel.send(f"⚠️ Couldn't parse process list: `{raw[:200]}`")
+        return
+    if isinstance(data, dict):
+        data = [data]
+
+    # Build the set of PowerShell PIDs that currently own a live claude.exe —
+    # those are healthy and must NOT be killed.
+    live_parents = set()
+    for c in list_running():
+        ppid = _get_parent_pid_sync(c.pid)
+        if ppid:
+            live_parents.add(ppid)
+
+    killed: list[int] = []
+    skipped: list[int] = []
+    for entry in data:
+        ppid = entry.get("Pid")
+        if not isinstance(ppid, int):
+            continue
+        if ppid in live_parents:
+            skipped.append(ppid)
+            continue
+        if _kill_tree(ppid):
+            killed.append(ppid)
+
+    lines = []
+    if killed:
+        s = "s" if len(killed) > 1 else ""
+        lines.append(
+            f"🧹 Closed **{len(killed)}** orphan terminal window{s}: "
+            + ", ".join(f"`{p}`" for p in killed)
+        )
+    if skipped:
+        s = "s" if len(skipped) > 1 else ""
+        lines.append(f"Left **{len(skipped)}** window{s} alone (live claude.exe inside).")
+    if not killed and not skipped:
+        lines.append("Nothing to clean up.")
+    await channel.send("\n".join(lines))
 
 
 async def _run_console_helper(pid: int, prompt: str, mode: str) -> str:
@@ -1345,7 +1463,7 @@ async def cmd_ask(channel, channel_id, user_id, prompt: str):
 COMMANDS = {
     "help", "status", "where", "new", "cancel", "live", "detach", "look",
     "close", "cd", "sessions", "resume", "attach", "spawn", "launch", "usage", "esc",
-    "keys", "pad",
+    "keys", "pad", "cleanup",
 }
 
 
@@ -1407,6 +1525,8 @@ async def dispatch(channel, channel_id: int, user_id: int, text: str):
             await cmd_keys(channel, channel_id, user_id, tail)
         elif head == "pad":
             await cmd_pad(channel, channel_id)
+        elif head == "cleanup":
+            await cmd_cleanup(channel)
         return
 
     # First word isn't a command — treat the whole thing as a prompt.
