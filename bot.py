@@ -1797,6 +1797,14 @@ async def _orphan_channel_sweeper(interval: float = 60.0):
             print(f"  _orphan_channel_sweeper error (continuing): {e}")
 
 
+# Skip auto-attach for claude.exe processes younger than this. Filters out the
+# short-lived scrapers / `claude --version` / IDE probes that spawn a session
+# JSON for a few seconds and exit — would otherwise produce a perpetual
+# attached→exited→closing-channel notification loop. Real user sessions take
+# longer than this to start typing anyway.
+AUTO_SPAWN_MIN_AGE_SECONDS = 30
+
+
 async def _auto_spawn_watcher(interval: float = 15.0):
     """Poll for newly-appeared claude.exe sessions; auto-create a Discord channel.
 
@@ -1807,6 +1815,7 @@ async def _auto_spawn_watcher(interval: float = 15.0):
 
     Channels are created in the guild of the first env-configured control room.
     Skips sessions that are already attached to a channel (in attached_pids).
+    Also skips sessions younger than AUTO_SPAWN_MIN_AGE_SECONDS.
     """
     primary_user = next(iter(ALLOWED_USERS), 0)
     first_pass = True
@@ -1825,8 +1834,15 @@ async def _auto_spawn_watcher(interval: float = 15.0):
             # Drop dead PIDs from seen so PID-reuse doesn't suppress legitimate new sessions.
             _auto_spawn_seen.intersection_update(current_pids)
 
+            now_ms = time.time() * 1000
+            min_age_ms = AUTO_SPAWN_MIN_AGE_SECONDS * 1000
             already_attached = set(attached_pids.values())
-            new_sessions = [c for c in running if c.pid not in _auto_spawn_seen and c.pid not in already_attached]
+            new_sessions = [
+                c for c in running
+                if c.pid not in _auto_spawn_seen
+                and c.pid not in already_attached
+                and (c.started_at_ms is None or now_ms - c.started_at_ms >= min_age_ms)
+            ]
             if not new_sessions:
                 continue
 
