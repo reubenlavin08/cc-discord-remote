@@ -1986,6 +1986,12 @@ async def on_ready():
             print(f"  couldn't auto-delete channel {ch_id}: {e}")
     sessions.conn.commit()
 
+    # Offline-message catchup: walk each tracked channel's history since the last
+    # message we processed, and run anything we missed while offline. Bot-authored
+    # messages and non-allowed senders are skipped; ordering is preserved by
+    # asking Discord for oldest-first history.
+    asyncio.create_task(_replay_offline_messages())
+
     # Sync slash commands to each guild the allowed channels live in (instant per-guild).
     global _pid_watcher_started, _auto_spawn_watcher_started, _orphan_sweeper_started
     if not _pid_watcher_started:
@@ -2075,12 +2081,8 @@ async def _safe_unreact(message: discord.Message, emoji: str):
         pass
 
 
-@bot.event
-async def on_message(message: discord.Message):
-    if message.author == bot.user:
-        return
-    if message.author.id not in ALLOWED_USERS:
-        return
+async def _process_message(message: discord.Message) -> None:
+    """Shared message handler used both live (on_message) and on startup (catchup)."""
 
     # Attachments in an attached channel → save files + forward any text/long-paste.
     if message.channel.id in attached_pids and message.attachments:
@@ -2125,6 +2127,80 @@ async def on_message(message: discord.Message):
         raise
     await _safe_unreact(message, "⌛")
     await _safe_react(message, "✅")
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author == bot.user:
+        return
+    if message.author.id not in ALLOWED_USERS:
+        return
+
+    # Mark this message as seen before processing so a crash/restart doesn't
+    # cause us to replay it via the offline-catchup pass.
+    sessions.set_last_msg_id(message.channel.id, message.id)
+
+    await _process_message(message)
+
+
+async def _replay_offline_messages() -> None:
+    """For each tracked channel, replay messages from allowed users that arrived
+    while the bot was offline.
+
+    Iterates Discord history since the last persisted last_msg_id and runs each
+    qualifying message through the same handler as live traffic. Marks each
+    message as seen BEFORE processing so a crash mid-replay doesn't loop forever
+    on a poison message."""
+    channels_to_replay = list(ALLOWED_CHANNELS)
+    total_replayed = 0
+    for ch_id in channels_to_replay:
+        chan = bot.get_channel(ch_id)
+        if chan is None:
+            continue
+        last_id = sessions.get_last_msg_id(ch_id)
+        if last_id is None:
+            # First time we've ever seen this channel — establish a baseline at the
+            # latest message so we don't blast through old history on first install.
+            try:
+                async for last_msg in chan.history(limit=1):
+                    sessions.set_last_msg_id(ch_id, last_msg.id)
+                    break
+            except Exception:
+                pass
+            continue
+
+        try:
+            anchor = discord.Object(id=last_id)
+            queued = [m async for m in chan.history(after=anchor, limit=None, oldest_first=True)]
+        except discord.Forbidden:
+            continue
+        except Exception as e:
+            print(f"  catchup: history fetch failed for channel {ch_id}: {e}")
+            continue
+
+        eligible = [m for m in queued if m.author.id in ALLOWED_USERS and m.author != bot.user]
+        if not eligible:
+            # Still advance the cursor past any bot/non-allowed messages so we don't
+            # refetch them every restart.
+            if queued:
+                sessions.set_last_msg_id(ch_id, queued[-1].id)
+            continue
+
+        try:
+            await chan.send(f"📨 Catching up on {len(eligible)} message(s) sent while I was offline…")
+        except Exception:
+            pass
+
+        for msg in eligible:
+            sessions.set_last_msg_id(ch_id, msg.id)
+            try:
+                await _process_message(msg)
+                total_replayed += 1
+            except Exception as e:
+                print(f"  catchup: failed to replay message {msg.id} in channel {ch_id}: {e}")
+
+    if total_replayed:
+        print(f"  catchup: replayed {total_replayed} offline message(s) across {len(channels_to_replay)} channel(s)")
 
 
 @tree.command(name="cc", description="Drive Claude Code (try 'help' for commands)")

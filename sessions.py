@@ -24,10 +24,14 @@ class SessionStore:
             );
             """
         )
-        # Add attached_pid column if it doesn't exist (idempotent migration).
+        # Idempotent migrations: add columns introduced after the original schema.
         cols = {row[1] for row in self.conn.execute("PRAGMA table_info(sessions)")}
         if "attached_pid" not in cols:
             self.conn.execute("ALTER TABLE sessions ADD COLUMN attached_pid INTEGER")
+        if "last_msg_id" not in cols:
+            # Discord snowflake of the most recent message we processed in this channel.
+            # Used at bot startup to replay anything that arrived while we were offline.
+            self.conn.execute("ALTER TABLE sessions ADD COLUMN last_msg_id INTEGER")
         self.conn.commit()
 
     # ---- session state ---------------------------------------------------
@@ -96,6 +100,30 @@ class SessionStore:
                 "SELECT channel_id, attached_pid FROM sessions WHERE attached_pid IS NOT NULL"
             ).fetchall()
         ]
+
+    # ---- offline-message replay --------------------------------------------
+
+    def get_last_msg_id(self, channel_id: int) -> Optional[int]:
+        row = self.conn.execute(
+            "SELECT last_msg_id FROM sessions WHERE channel_id = ?", (channel_id,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def set_last_msg_id(self, channel_id: int, msg_id: int) -> None:
+        existing = self.conn.execute(
+            "SELECT 1 FROM sessions WHERE channel_id = ?", (channel_id,)
+        ).fetchone()
+        if existing:
+            self.conn.execute(
+                "UPDATE sessions SET last_msg_id = ? WHERE channel_id = ?",
+                (msg_id, channel_id),
+            )
+        else:
+            self.conn.execute(
+                "INSERT INTO sessions (channel_id, last_msg_id, cwd) VALUES (?, ?, ?)",
+                (channel_id, msg_id, self.default_cwd),
+            )
+        self.conn.commit()
 
     def reset(self, channel_id: int) -> None:
         _, cwd = self.get(channel_id)
