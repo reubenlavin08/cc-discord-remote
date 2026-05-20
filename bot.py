@@ -1709,38 +1709,63 @@ async def _pid_watcher(interval: float = 15.0):
     Control rooms (env-configured ALLOWED_CHANNEL_IDS) are NEVER deleted — they
     just get their dead attachment cleared so the channel survives a Claude
     restart. Other channels get a goodbye message then are deleted.
+
+    Sources from the UNION of in-memory attached_pids and sessions.db so we
+    catch named channels created via auto-spawn whose cmd_attach didn't update
+    the in-memory dict. Only clears state AFTER chan.delete() succeeds, so
+    transient Discord errors (rate-limit, network blip) get retried next loop
+    instead of orphaning the channel forever.
     """
     while True:
         try:
             await asyncio.sleep(interval)
-            for ch_id, pid in list(attached_pids.items()):
+            tracked: Dict[int, int] = dict(attached_pids)
+            for ch_id, pid in sessions.all_attached():
+                if pid is not None:
+                    tracked.setdefault(ch_id, pid)
+
+            for ch_id, pid in tracked.items():
                 if pid_alive(pid):
                     continue
-                attached_pids.pop(ch_id, None)
+
+                # Cancel mirror task immediately — it can't drive a dead process.
                 mt = mirror_tasks.pop(ch_id, None)
                 if mt and not mt.done():
                     mt.cancel()
-                sessions.set_attached_pid(ch_id, None)
 
                 if ch_id in CONTROL_CHANNELS:
+                    attached_pids.pop(ch_id, None)
+                    sessions.set_attached_pid(ch_id, None)
                     continue
 
-                ALLOWED_CHANNELS.discard(ch_id)
                 chan = bot.get_channel(ch_id)
                 if chan is None:
+                    # Discord channel already gone (deleted out-of-band). Just clean DB.
+                    attached_pids.pop(ch_id, None)
+                    ALLOWED_CHANNELS.discard(ch_id)
                     sessions.conn.execute("DELETE FROM sessions WHERE channel_id = ?", (ch_id,))
                     sessions.conn.commit()
                     continue
+
                 try:
                     await chan.send(f"🪦 Terminal exited (PID {pid} gone) — closing this channel.")
+                except Exception:
+                    pass  # Goodbye message is nice-to-have, don't block deletion on it.
+
+                try:
                     await chan.delete(reason="cc-discord-remote: terminal exited")
-                    sessions.conn.execute("DELETE FROM sessions WHERE channel_id = ?", (ch_id,))
-                    sessions.conn.commit()
-                    print(f"  auto-closed channel {ch_id} (PID {pid} died)")
                 except discord.Forbidden:
                     print(f"  can't auto-close channel {ch_id} (missing Manage Channels)")
-                except Exception as e:
+                    continue  # Don't clear state — retry next loop in case perms come back.
+                except discord.HTTPException as e:
                     print(f"  couldn't auto-close channel {ch_id}: {e}")
+                    continue  # Don't clear state — retry next loop.
+
+                attached_pids.pop(ch_id, None)
+                ALLOWED_CHANNELS.discard(ch_id)
+                sessions.conn.execute("DELETE FROM sessions WHERE channel_id = ?", (ch_id,))
+                sessions.conn.commit()
+                print(f"  auto-closed channel {ch_id} (PID {pid} died)")
         except asyncio.CancelledError:
             raise
         except Exception as e:
