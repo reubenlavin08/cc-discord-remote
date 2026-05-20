@@ -82,7 +82,7 @@ Claude Code ships a built-in `/remote-control` feature, but it requires the phon
 - `!cc usage` — fetch usage stats from claude-monitor (model, context %, cost, 5h + weekly limits)
 
 **Quality of life:**
-- @mention pings on turns longer than 15 s and on pending approvals
+- @mention pings on pending approvals only (turn completions stay quiet to avoid notification overload)
 - SQLite audit log of every command (`sessions.db`)
 - Auto-spawn watcher: a fresh `claude` started in any terminal gets its own Discord channel within ~15 s
 

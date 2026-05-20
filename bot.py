@@ -15,9 +15,6 @@ try:
 except Exception:
     pass
 
-# Ping the user with @mention if a turn takes longer than this. Quick replies stay quiet.
-PING_AFTER_SECONDS = 15
-
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
@@ -1483,14 +1480,16 @@ async def _mirror_loop(channel, channel_id: int, user_id: int, jsonl_path: Path,
                     and last_assistant_at > 0
                     and not pinged_for_turn
                 ):
-                    # Turn appears complete — flush orphans, ping user.
+                    # Turn appears complete — flush orphans, send a quiet "done" line.
+                    # No @mention here: turn completions happen often enough that pinging
+                    # on each one buries the user in notifications. Approvals still ping.
                     for _id, (name, inp) in list(pending_tools.items()):
                         preview = _format_tool_input(name, inp)
                         icon = "🔍" if name in READ_ONLY_TOOLS else "🛠️"
                         await channel.send(f"{icon} `{name}` — {preview}")
                     pending_tools.clear()
                     elapsed = time.time() - last_assistant_at
-                    await channel.send(f"<@{user_id}> ✅ _turn complete on `{label}`_")
+                    await channel.send(f"✅ _turn complete on `{label}`_")
                     pinged_for_turn = True
 
             await asyncio.sleep(0.5)
@@ -1593,8 +1592,7 @@ async def cmd_ask(channel, channel_id, user_id, prompt: str):
                         sessions.set_session(channel_id, new_session_id)
                     cost_str = f" · ${cost:.4f}" if cost else ""
                     elapsed = time.time() - turn_started_at
-                    ping = f"<@{user_id}> " if elapsed > PING_AFTER_SECONDS else ""
-                    await channel.send(f"{ping}_done{cost_str} · {elapsed:.0f}s_")
+                    await channel.send(f"_done{cost_str} · {elapsed:.0f}s_")
                     sessions.audit(
                         channel_id, user_id, "turn_done",
                         json.dumps({"session_id": new_session_id, "cost_usd": cost}),
