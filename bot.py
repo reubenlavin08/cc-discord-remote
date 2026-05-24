@@ -101,7 +101,7 @@ def _is_authorised(user_id: int, channel_id: int) -> bool:
 
 
 def _format_tool_input(tool_name: str, tool_input: dict) -> str:
-    """One-line preview of what a tool is doing."""
+    """One-line preview of what a tool is doing. AskUserQuestion is multi-line."""
     if tool_name == "Bash":
         return f"`{(tool_input.get('command') or '')[:120]}`"
     if tool_name in ("Read", "Write", "Edit"):
@@ -114,11 +114,87 @@ def _format_tool_input(tool_name: str, tool_input: dict) -> str:
         return f"`{tool_input.get('pattern', '?')}`"
     if tool_name == "LS":
         return f"`{tool_input.get('path', '.')}`"
+    if tool_name == "AskUserQuestion":
+        # Render the question + numbered options so the user can answer from
+        # Discord by typing the option number (the TUI picker accepts digits).
+        questions = tool_input.get("questions") or []
+        if not questions:
+            return ""
+        lines: list[str] = []
+        for q in questions:
+            if not isinstance(q, dict):
+                continue
+            qtext = (q.get("question") or "").strip()
+            multi = q.get("multiSelect")
+            suffix = " *(pick one or more)*" if multi else ""
+            lines.append(f"❓ **{qtext}**{suffix}")
+            opts = q.get("options") or []
+            for i, opt in enumerate(opts, 1):
+                if not isinstance(opt, dict):
+                    continue
+                label = (opt.get("label") or "").strip()
+                desc = (opt.get("description") or "").strip()
+                if desc:
+                    lines.append(f"  `{i}.` **{label}** — {desc}")
+                else:
+                    lines.append(f"  `{i}.` **{label}**")
+        return "\n" + "\n".join(lines) if lines else ""
     # Fallback — show first useful arg.
     for k in ("name", "url", "query", "command"):
         if k in tool_input:
             return f"`{k}: {str(tool_input[k])[:100]}`"
     return ""
+
+
+def _pending_picker_tool(jsonl_path) -> str | None:
+    """Return the name of the most recent unresolved tool_use in this JSONL,
+    iff it's an interactive picker (AskUserQuestion). Used by cmd_terminal_send
+    to decide whether sending Esc would cancel an open picker that the user is
+    about to answer."""
+    try:
+        path = Path(jsonl_path)
+        if not path.is_file():
+            return None
+        # Last ~64 KB is enough — picker tool_use is usually one of the last events.
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            f.seek(max(0, size - 65536))
+            chunk = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+    last_tool_use: tuple[str, str] | None = None  # (id, name)
+    resolved: set = set()
+    for line in chunk.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        t = obj.get("type")
+        msg = obj.get("message") or {}
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        if t == "assistant":
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tid = block.get("id")
+                    name = block.get("name", "")
+                    if tid:
+                        last_tool_use = (tid, name)
+        elif t == "user":
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    rid = block.get("tool_use_id")
+                    if rid:
+                        resolved.add(rid)
+
+    if last_tool_use and last_tool_use[0] not in resolved:
+        return last_tool_use[1]
+    return None
 
 
 # ---------- command handlers ------------------------------------------------
@@ -1526,9 +1602,14 @@ async def cmd_terminal_send(channel, channel_id, user_id, text: str):
     async with channel.typing():
         # Dismiss any TUI menu (e.g. /usage output, picker, dialog) that would
         # otherwise swallow the injected keystrokes. Esc at the normal prompt
-        # is a no-op, so this is safe to always send before plain-text typing.
+        # is a no-op, so this is safe to send before plain-text typing —
+        # EXCEPT when an interactive picker (AskUserQuestion) is waiting on
+        # input, because Esc cancels the picker. In that case the user is
+        # typing the option number/text, and we want it to reach the picker.
         if mode == "type":
-            await _run_console_helper(pid, "", mode="esc")
+            picker = _pending_picker_tool(session_jsonl_path(info.cwd, info.session_id))
+            if picker != "AskUserQuestion":
+                await _run_console_helper(pid, "", mode="esc")
         result = await _run_console_helper(pid, text, mode=mode)
 
     if "AttachConsole" in result and "failed" in result:
