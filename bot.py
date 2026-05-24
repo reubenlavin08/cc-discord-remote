@@ -1524,6 +1524,11 @@ async def cmd_terminal_send(channel, channel_id, user_id, text: str):
     mode = "send" if is_slash else "type"
 
     async with channel.typing():
+        # Dismiss any TUI menu (e.g. /usage output, picker, dialog) that would
+        # otherwise swallow the injected keystrokes. Esc at the normal prompt
+        # is a no-op, so this is safe to always send before plain-text typing.
+        if mode == "type":
+            await _run_console_helper(pid, "", mode="esc")
         result = await _run_console_helper(pid, text, mode=mode)
 
     if "AttachConsole" in result and "failed" in result:
@@ -2186,12 +2191,26 @@ async def _replay_offline_messages() -> None:
                 sessions.set_last_msg_id(ch_id, queued[-1].id)
             continue
 
-        try:
-            await chan.send(f"📨 Catching up on {len(eligible)} message(s) sent while I was offline…")
-        except Exception:
-            pass
-
+        # Re-read the cursor right before processing each message to avoid
+        # double-handling: this task runs concurrently with on_message, so a
+        # live arrival between our get_last_msg_id and chan.history call could
+        # land in `queued` while also being processed by on_message. Discord
+        # snowflakes are monotonic, so msg.id <= cursor means already handled.
+        announced = False
         for msg in eligible:
+            current_cursor = sessions.get_last_msg_id(ch_id) or 0
+            if msg.id <= current_cursor:
+                continue
+            if not announced:
+                remaining = sum(
+                    1 for m in eligible
+                    if m.id > (sessions.get_last_msg_id(ch_id) or 0)
+                )
+                try:
+                    await chan.send(f"📨 Catching up on {remaining} message(s) sent while I was offline…")
+                except Exception:
+                    pass
+                announced = True
             sessions.set_last_msg_id(ch_id, msg.id)
             try:
                 await _process_message(msg)
