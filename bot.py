@@ -337,6 +337,13 @@ async def cmd_resume_spawn(channel, user_id: int, s):
     await asyncio.sleep(2)
     await _run_console_helper(new_pid, "", mode="enter")
 
+    # Second defensive Enter for the "Resume from summary / full / don't ask"
+    # picker that Claude Code shows for old or large sessions. Default
+    # selection is "Resume from summary (recommended)", so a plain Enter picks
+    # it. Harmless if no picker is up — Claude's prompt ignores empty submits.
+    await asyncio.sleep(3)
+    await _run_console_helper(new_pid, "", mode="enter")
+
     # Wait for the session JSON — this will hold the NEW forked session_id Claude assigned.
     session_deadline = time.time() + 30
     while time.time() < session_deadline:
@@ -366,6 +373,16 @@ async def cmd_resume_spawn(channel, user_id: int, s):
     ALLOWED_CHANNELS.add(new_chan.id)
     await cmd_attach(new_chan, new_chan.id, user_id, str(new_pid))
     await channel.send(f"📡 Resumed `{short}` (PID {new_pid}) in <#{new_chan.id}>.")
+
+    # Auto-look so the user sees the screen state immediately on the new
+    # channel — no need to manually `!cc look`. Useful after resume because
+    # the TUI may still be showing a picker / boot screen that the JSONL
+    # mirror won't capture (mirror only fires once Claude writes events).
+    try:
+        await asyncio.sleep(1.5)
+        await cmd_look(new_chan, new_chan.id)
+    except Exception as e:
+        print(f"  cmd_resume_spawn: auto-look failed: {e}")
 
 
 class ResumeSelect(discord.ui.Select):
