@@ -38,6 +38,9 @@ ALLOWED_CHANNELS = {int(x) for x in os.environ.get("ALLOWED_CHANNEL_IDS", "").sp
 # Snapshot of the env-configured channels — never auto-deleted, even if unattached.
 CONTROL_CHANNELS = set(ALLOWED_CHANNELS)
 DEFAULT_CWD = os.environ.get("DEFAULT_CWD") or str(Path.cwd())
+# Discord category to nest auto-created terminal channels under. Falls back to
+# root (guild-level uncategorized) if no category with this name exists.
+TERMINAL_CATEGORY_NAME = os.environ.get("TERMINAL_CATEGORY_NAME", "terminal")
 
 PREFIX = "!cc"
 MAX_CHUNK = 1900
@@ -98,6 +101,18 @@ def _is_authorised(user_id: int, channel_id: int) -> bool:
     if ALLOWED_CHANNELS and channel_id not in ALLOWED_CHANNELS:
         return False
     return True
+
+
+def _terminal_category(guild):
+    """Return the CategoryChannel matching TERMINAL_CATEGORY_NAME (case-insensitive),
+    or None if not found. Used to nest auto-created terminal channels."""
+    if guild is None:
+        return None
+    target = TERMINAL_CATEGORY_NAME.lower()
+    for cat in guild.categories:
+        if cat.name.lower() == target:
+            return cat
+    return None
 
 
 def _format_tool_input(tool_name: str, tool_input: dict) -> str:
@@ -360,7 +375,10 @@ async def cmd_resume_spawn(channel, user_id: int, s):
     raw_name = s.custom_name or s.first_prompt or short
     sanitized = _sanitize_channel_name(raw_name)
     try:
-        new_chan = await channel.guild.create_text_channel(name=sanitized)
+        new_chan = await channel.guild.create_text_channel(
+            name=sanitized,
+            category=_terminal_category(channel.guild),
+        )
     except discord.Forbidden:
         await channel.send(
             "⚠️ Terminal up but can't make a channel — bot needs **Manage Channels**."
@@ -891,7 +909,10 @@ async def cmd_spawn(channel, user_id: int, query: str):
 
     channel_name = _sanitize_channel_name(match.name or match.session_id[:8])
     try:
-        new_chan = await channel.guild.create_text_channel(name=channel_name)
+        new_chan = await channel.guild.create_text_channel(
+            name=channel_name,
+            category=_terminal_category(channel.guild),
+        )
     except discord.Forbidden:
         await channel.send(
             "⚠️ Bot needs **Manage Channels** permission. Re-authorize with:\n"
@@ -1073,7 +1094,10 @@ async def cmd_launch(channel, user_id: int, args: str):
     # Create the Discord channel and attach.
     sanitized = _sanitize_channel_name(name)
     try:
-        new_chan = await channel.guild.create_text_channel(name=sanitized)
+        new_chan = await channel.guild.create_text_channel(
+            name=sanitized,
+            category=_terminal_category(channel.guild),
+        )
     except discord.Forbidden:
         await channel.send(
             "⚠️ Started the terminal but can't make a channel — bot needs **Manage Channels**."
@@ -1994,7 +2018,10 @@ async def _auto_spawn_watcher(interval: float = 15.0):
                     continue
                 channel_name = _sanitize_channel_name(info.name or info.session_id[:8])
                 try:
-                    new_chan = await guild.create_text_channel(name=channel_name)
+                    new_chan = await guild.create_text_channel(
+                        name=channel_name,
+                        category=_terminal_category(guild),
+                    )
                 except discord.Forbidden:
                     print(f"  auto-spawn: missing Manage Channels in guild {guild.id}")
                     continue
