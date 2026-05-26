@@ -2259,6 +2259,9 @@ async def _process_message(message: discord.Message) -> None:
     await _safe_react(message, "✅")
 
 
+_on_message_lock = asyncio.Lock()
+
+
 @bot.event
 async def on_message(message: discord.Message):
     if message.author == bot.user:
@@ -2266,9 +2269,18 @@ async def on_message(message: discord.Message):
     if message.author.id not in ALLOWED_USERS:
         return
 
-    # Mark this message as seen before processing so a crash/restart doesn't
-    # cause us to replay it via the offline-catchup pass.
-    sessions.set_last_msg_id(message.channel.id, message.id)
+    # Dedup against gateway RESUMEs that re-deliver messages we've already
+    # processed (discord.py is supposed to handle this, but in practice it
+    # sometimes refires on_message after a WebSocket reconnect). Snowflake
+    # ids are monotonic per channel; if our persisted cursor is already at
+    # or past this id, we've handled it. Lock makes the check-and-set atomic
+    # so two concurrent invocations for the same msg can't both pass the
+    # check before the cursor advances. Processing happens outside the lock.
+    async with _on_message_lock:
+        last_id = sessions.get_last_msg_id(message.channel.id) or 0
+        if message.id <= last_id:
+            return
+        sessions.set_last_msg_id(message.channel.id, message.id)
 
     await _process_message(message)
 
