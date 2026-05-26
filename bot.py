@@ -1416,8 +1416,22 @@ async def cmd_keys(channel, channel_id, user_id, sequence: str):
         await channel.send(f"⌨️ Sent: `{sequence}`")
 
 
-async def _render_piece(channel, kind: str, data: dict, pending_tools: Dict[str, tuple]):
-    """Render one parsed JSONL piece into Discord, pairing tools with their results."""
+async def _render_piece(
+    channel,
+    kind: str,
+    data: dict,
+    pending_tools: Dict[str, tuple],
+    pickers_rendered: set,
+):
+    """Render one parsed JSONL piece into Discord, pairing tools with their results.
+
+    AskUserQuestion is special-cased to render eagerly on tool_use rather than
+    waiting for the (paired) tool_result: the tool BLOCKS Claude until the user
+    answers, so deferring the Discord message would hide the question from the
+    user driving via phone, leaving the picker hanging indefinitely. Tracked
+    in `pickers_rendered` so the eventual tool_result is shown as just the
+    answer, not a re-render of the prompt.
+    """
     if kind == "text":
         # Flush orphan tools first, then send the text.
         for _id, (name, inp) in list(pending_tools.items()):
@@ -1428,12 +1442,27 @@ async def _render_piece(channel, kind: str, data: dict, pending_tools: Dict[str,
         await send_chunked(channel, data["text"])
     elif kind == "tool":
         tid = data.get("id")
+        name = data["name"]
+        if name == "AskUserQuestion":
+            # Eager render with @mention so the user actually notices the
+            # blocking prompt and can answer it.
+            preview = _format_tool_input(name, data["input"])
+            primary = next(iter(ALLOWED_USERS), None)
+            ping = f"<@{primary}> " if primary else ""
+            await send_chunked(
+                channel,
+                f"{ping}❓ **Claude needs your input** — reply with the option number:"
+                f"{preview}",
+            )
+            if tid:
+                pickers_rendered.add(tid)
+            return
         if tid:
-            pending_tools[tid] = (data["name"], data["input"])
+            pending_tools[tid] = (name, data["input"])
         else:
-            preview = _format_tool_input(data["name"], data["input"])
-            icon = "🔍" if data["name"] in READ_ONLY_TOOLS else "🛠️"
-            await channel.send(f"{icon} `{data['name']}` — {preview}")
+            preview = _format_tool_input(name, data["input"])
+            icon = "🔍" if name in READ_ONLY_TOOLS else "🛠️"
+            await channel.send(f"{icon} `{name}` — {preview}")
     elif kind == "tool_result":
         tid = data.get("id")
         text = data["text"]
@@ -1441,7 +1470,10 @@ async def _render_piece(channel, kind: str, data: dict, pending_tools: Dict[str,
         shown = text[:400]
         ellip = "…" if len(text) > 400 else ""
         err_tag = " ❌" if err else ""
-        if tid and tid in pending_tools:
+        if tid and tid in pickers_rendered:
+            pickers_rendered.discard(tid)
+            line = f"↳ **Answered:**{err_tag}\n```\n{shown}{ellip}\n```"
+        elif tid and tid in pending_tools:
             name, inp = pending_tools.pop(tid)
             preview = _format_tool_input(name, inp)
             icon = "🔍" if name in READ_ONLY_TOOLS else "🛠️"
@@ -1461,6 +1493,10 @@ async def _mirror_loop(channel, channel_id: int, user_id: int, jsonl_path: Path,
     pending_tools: Dict[str, tuple] = {}
     pending_tool_ids: set = set()
     resolved_tool_ids: set = set()
+    # AskUserQuestion tool_use_ids we've already eagerly rendered to Discord;
+    # used so the eventual tool_result is shown as "Answered: …" rather than
+    # re-rendering the picker prompt. See _render_piece's special-case.
+    pickers_rendered: set = set()
     # Tool-approval tracking: per-tool emit time, surfacing state, and the set of
     # tool_ids we already screen-checked (and decided no popup was visible) so we
     # don't re-poll the terminal every mirror tick.
@@ -1544,7 +1580,7 @@ async def _mirror_loop(channel, channel_id: int, user_id: int, jsonl_path: Path,
 
                 pieces = extract_user_facing(new_objs)
                 for kind, data in pieces:
-                    await _render_piece(channel, kind, data, pending_tools)
+                    await _render_piece(channel, kind, data, pending_tools, pickers_rendered)
                     if kind == "text":
                         last_assistant_at = time.time()
                         pinged_for_turn = False
