@@ -2259,6 +2259,48 @@ async def _adopt_orphan_live_sessions():
         await asyncio.sleep(1)
 
 
+async def _sweep_duplicate_terminal_channels():
+    """Remove orphan DUPLICATE channels in the terminal category — copies left
+    behind by past reboots (same name as a live/tracked channel but not attached
+    and not in the DB). Conservative: only deletes a same-named duplicate when a
+    tracked channel of that name exists to keep, so we never remove a unique
+    channel."""
+    guild = None
+    for cid in CONTROL_CHANNELS:
+        ch = bot.get_channel(cid)
+        if ch and getattr(ch, "guild", None):
+            guild = ch.guild
+            break
+    if guild is None:
+        return
+    cat = _terminal_category(guild)
+    if cat is None:
+        return
+    db_tracked = {r[0] for r in sessions.conn.execute("SELECT channel_id FROM sessions")}
+    tracked = set(attached_pids.keys()) | db_tracked
+
+    by_name: Dict[str, list] = {}
+    for chan in cat.channels:
+        if getattr(chan, "type", None) is not None and not hasattr(chan, "send"):
+            continue  # skip non-text (voice etc.)
+        by_name.setdefault(chan.name, []).append(chan)
+
+    for name, chans in by_name.items():
+        if len(chans) < 2:
+            continue
+        if not any(c.id in tracked for c in chans):
+            continue  # none tracked — don't guess which to keep
+        for c in chans:
+            if c.id in tracked or c.id in CONTROL_CHANNELS:
+                continue
+            try:
+                await c.delete(reason="cc-discord-remote: duplicate orphan terminal channel")
+                ALLOWED_CHANNELS.discard(c.id)
+                print(f"  swept duplicate terminal channel #{name} ({c.id})")
+            except Exception as e:
+                print(f"  couldn't sweep duplicate #{name} ({c.id}): {e}")
+
+
 async def _restore_terminals_on_boot():
     """After a reboot every claude.exe died. For each channel with a resumable
     session_id but no live process, resume it and re-attach to the SAME channel.
@@ -2400,6 +2442,7 @@ async def on_ready():
         try:
             await _restore_terminals_on_boot()
             await _adopt_orphan_live_sessions()
+            await _sweep_duplicate_terminal_channels()
         finally:
             await _replay_offline_messages()
     asyncio.create_task(_boot_then_replay())
