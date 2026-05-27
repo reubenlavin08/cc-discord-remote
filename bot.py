@@ -649,6 +649,61 @@ class ToolApprovalView(discord.ui.View):
 # Claude Code's pickers / popups without typing `!cc keys ...` each time.
 
 
+class _AskOptionButton(discord.ui.Button):
+    """One clickable option for an AskUserQuestion picker. Clicking it selects
+    the corresponding numbered option in the attached terminal's TUI."""
+    def __init__(self, channel_id: int, number: int, label: str, row: int):
+        super().__init__(
+            label=f"{number}. {label[:72]}",
+            style=discord.ButtonStyle.primary,
+            row=row,
+        )
+        self.channel_id = channel_id
+        self.number = number
+
+    async def callback(self, interaction: discord.Interaction):
+        if not _is_authorised(interaction.user.id, interaction.channel_id):
+            await interaction.response.send_message("Unauthorized.", ephemeral=True)
+            return
+        pid = attached_pids.get(self.channel_id)
+        if pid is None:
+            await interaction.response.send_message(
+                "Not attached anymore — can't answer.", ephemeral=True
+            )
+            return
+        await interaction.response.defer()
+        # Navigate deterministically: clamp to the top with a few Ups (no-op once
+        # at option 1), step Down (number-1) times, then Enter to confirm. This
+        # works regardless of where the picker cursor currently sits and doesn't
+        # rely on digit-select (AskUserQuestion's footer only advertises ↑/↓).
+        seq = ["up"] * 5 + ["down"] * (self.number - 1) + ["enter"]
+        await _run_console_helper(pid, ",".join(seq), mode="keys")
+        sessions.audit(self.channel_id, interaction.user.id, "askq_answer", str(self.number))
+        # Disable all buttons and mark the chosen one.
+        view: discord.ui.View = self.view
+        for child in view.children:
+            child.disabled = True
+            if isinstance(child, _AskOptionButton) and child.number == self.number:
+                child.style = discord.ButtonStyle.success
+        view.stop()
+        try:
+            await interaction.message.edit(view=view)
+        except discord.HTTPException:
+            pass
+
+
+class AskUserQuestionView(discord.ui.View):
+    """Interactive button menu for an AskUserQuestion prompt. One button per
+    option of the FIRST question (Discord allows up to 25 buttons / 5 rows;
+    AskUserQuestion has ≤4-5 options, so one row). Multi-question prompts still
+    get the text rendering; the buttons answer the first question."""
+    def __init__(self, channel_id: int, option_labels: list):
+        super().__init__(timeout=3600)
+        self.channel_id = channel_id
+        for i, label in enumerate(option_labels[:5], 1):
+            self.add_item(_AskOptionButton(channel_id, i, label, row=(i - 1) // 5))
+
+
 class RemoteKeypadView(discord.ui.View):
     """3 × 5 grid: arrows, modifier keys, number keys for numbered popups, Look."""
 
@@ -1470,19 +1525,37 @@ async def _render_piece(
         tid = data.get("id")
         name = data["name"]
         if name == "AskUserQuestion":
-            # Eager render with @mention so the user actually notices the
-            # blocking prompt and can answer it.
+            # Eager render with @mention so the user notices the blocking prompt,
+            # AND attach clickable option buttons so they can answer with a tap
+            # instead of typing the number.
             print(f"  [mirror] eager-rendering AskUserQuestion tid={tid} to channel {channel.id}")
             preview = _format_tool_input(name, data["input"])
             primary = next(iter(ALLOWED_USERS), None)
             ping = f"<@{primary}> " if primary else ""
+            # Pull the first question's option labels for the button menu.
+            questions = (data["input"] or {}).get("questions") or []
+            option_labels: list = []
+            multi = False
+            if questions and isinstance(questions[0], dict):
+                multi = bool(questions[0].get("multiSelect"))
+                for opt in (questions[0].get("options") or []):
+                    if isinstance(opt, dict) and opt.get("label"):
+                        option_labels.append(opt["label"])
+            pid_here = attached_pids.get(channel.id)
+            # Buttons only for single-select, single-question prompts driven by a
+            # live terminal; otherwise fall back to text + type-the-number.
+            view = None
+            if pid_here and option_labels and not multi and len(questions) == 1:
+                view = AskUserQuestionView(channel.id, option_labels)
+            hint = "tap an option below" if view else "reply with the option number"
             try:
-                await send_chunked(
-                    channel,
-                    f"{ping}❓ **Claude needs your input** — reply with the option number:"
-                    f"{preview}",
-                )
-                print(f"  [mirror] AskUserQuestion render succeeded for tid={tid}")
+                # send_chunked can split long text; send the prompt body first,
+                # then a final short line carrying the buttons so the view always
+                # attaches to a delivered message.
+                await send_chunked(channel, f"{ping}❓ **Claude needs your input** — {hint}:{preview}")
+                if view is not None:
+                    await channel.send("⬇️ choose:", view=view)
+                print(f"  [mirror] AskUserQuestion render succeeded for tid={tid} (buttons={view is not None})")
             except Exception as e:
                 print(f"  [mirror] AskUserQuestion render FAILED for tid={tid}: {type(e).__name__}: {e}")
                 raise
