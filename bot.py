@@ -2267,6 +2267,8 @@ async def _restore_terminals_on_boot():
     primary_user = next(iter(ALLOWED_USERS), 0)
     restored_sids: set = set()
     for ch_id, session_id, cwd in sessions.all_resumable():
+        if ch_id in CONTROL_CHANNELS:
+            continue  # command room (SDK channel), not a terminal — never resume
         if ch_id in attached_pids:
             restored_sids.add(session_id)
             continue  # already live / re-attached by the on_ready restore loop
@@ -2277,6 +2279,13 @@ async def _restore_terminals_on_boot():
             continue
         if not cwd or cwd in ("?", "") or not Path(cwd).is_dir():
             print(f"  restore: skipping channel {ch_id} — cwd {cwd!r} not present")
+            continue
+        # Verify the session actually exists on disk — `claude --resume <id>`
+        # errors with "No conversation found" otherwise (stale SDK ids, pruned
+        # transcripts). Skip + leave the channel alone rather than spawn a
+        # doomed console.
+        if not session_jsonl_path(cwd, session_id).is_file():
+            print(f"  restore: session {session_id[:8]} JSONL missing in {cwd} — skipping")
             continue
         restored_sids.add(session_id)
         # If the session is somehow already live (e.g. user relaunched it), just attach.
