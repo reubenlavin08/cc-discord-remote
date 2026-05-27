@@ -18,9 +18,11 @@ Drive [Claude Code](https://claude.com/claude-code) running in a terminal on you
 - **True live-attach**, not screen-scraping — `AttachConsole` + `WriteConsoleInput` against any running `claude.exe`
 - **Bidirectional mirror** — terminal activity streams to Discord, Discord messages stream to the terminal
 - **TUI menus → Discord components** — slash commands (`/powerup`, `/model`, `/agents`, `/resume`) auto-snapshot the screen with a clickable keypad attached. Tap a button → key fires into the terminal → same Discord message edits in place with the new screen
+- **AskUserQuestion → tappable buttons** — when Claude asks a multiple-choice question, the bot eagerly posts it to Discord with one button per option and an @mention. Tap an option → the bot navigates the TUI picker and confirms. No typing required
 - **Per-tool Discord button approvals** — both in SDK mode (`can_use_tool`) and in attached-terminal mode (screen-detected popup → Allow / Deny / Deny + tell Claude buttons, with a Modal for free-text reasoning)
 - **One Discord channel per terminal** — `!cc spawn <name>` auto-creates `#<name>`, attached and mirroring; `!cc close` kills the PowerShell window too, not just the channel
-- **Resilient** — channel↔terminal mappings persist in SQLite; bot restart restores every mirror
+- **Survives reboots** — channels are bound to the durable `session_id`, not the ephemeral PID. On a machine restart the bot resumes every tracked terminal (`claude --resume`) and re-attaches its Discord channel. Channels it didn't create (e.g. notifications) are never deleted
+- **Offline message replay** — messages sent while the laptop was off are queued in Discord and processed in order when the bot comes back online
 - **Honest fallback** — when no live terminal exists for a session, headless Agent SDK takes over with the same JSONL format
 
 ## Why this exists
@@ -46,8 +48,8 @@ Claude Code ships a built-in `/remote-control` feature, but it requires the phon
 | `session_tail.py` | Polls the JSONL Claude writes during a live turn, parses new entries |
 | `session_files.py` | Lists prior sessions, resolves the `/rename` custom-title metadata |
 | `approvals.py` | Discord button-based tool-approval embed with 5-min timeout |
-| `sessions.py` | SQLite per-channel state + audit log |
-| `test_all.py` | Backend test sweep (15 passing) |
+| `sessions.py` | SQLite per-channel state (session_id, cwd, attached_pid, last_msg_id) + audit log |
+| `test_all.py` | Backend test sweep |
 
 ## Features
 
@@ -69,6 +71,14 @@ Claude Code ships a built-in `/remote-control` feature, but it requires the phon
 - `!cc keys <seq>` — raw key passthrough (e.g. `!cc keys down,down,enter`)
 - Type any `/`-prefixed message in an attached channel → bot types it into the terminal, waits for the screen to stabilize, posts the snapshot with a keypad already attached for navigation
 - Tool-approval popups in attached terminals auto-surface as Discord buttons (`✅ Allow / ❌ Deny / 💬 Deny + tell Claude`); the third opens a Modal for free-text reasoning
+- **AskUserQuestion** prompts render immediately (with @mention) as a button menu — one button per option. Tapping navigates the picker (Up-clamp → Down×n → Enter) and confirms; the bot then posts the chosen answer. Multi-select / multi-question prompts fall back to "reply with the number"
+
+**Resilience & restore:**
+- Channels are tracked by `session_id` (durable) rather than PID (ephemeral). When a session restarts in place under a new PID, the bot rebinds the channel instead of closing it
+- On a computer reboot, `_restore_terminals_on_boot` resumes every channel that has a session_id (`claude --resume` in its cwd) and re-attaches to the same Discord channel — your tabs come back
+- Live named sessions that lost their channels are re-adopted on startup; duplicate orphan channels are swept
+- The bot only ever auto-deletes channels under the `terminal` category (override with `TERMINAL_CATEGORY_NAME`) or hex-id orphans — human channels like `notifications` / `control-room` are never touched
+- Messages sent to a channel while the bot was offline are replayed in order on reconnect, de-duplicated against gateway re-delivery
 
 **Sessions:**
 - `!cc sessions` — list past sessions (renamed ones show their `/rename` title)
@@ -103,7 +113,10 @@ DISCORD_TOKEN=<bot token>
 ALLOWED_USER_IDS=<your discord user id>
 ALLOWED_CHANNEL_IDS=<channel id where bot listens>
 DEFAULT_CWD=C:/Users/<you>
+TERMINAL_CATEGORY_NAME=terminal   # optional; category auto-created channels nest under (default "terminal")
 ```
+
+The bot needs **Manage Channels** (create/delete terminal channels) and, if you want it to auto-recreate webhook-backed channels, **Manage Webhooks**.
 
 ## Limitations (honest)
 
@@ -122,6 +135,8 @@ Python 3.12 · `discord.py` 2.7 · `claude-agent-sdk` 0.2.82 · raw Win32 via `c
 - **Why tail the JSONL instead of reading the terminal screen?** `ReadConsoleOutputCharacter` only sees the visible window; long responses scroll off. The JSONL has the full structured history (text, tool_use, tool_result), which gives clean responses without ANSI codes or UI chrome.
 - **Why pair tool_use with tool_result by id?** Claude's session JSONL writes them as separate events. Pairing them in the bot means one Discord message per tool — `🛠️ Bash — ls *.py ↳ bot.py runner.py ...` — instead of two scattered ones.
 - **Why a "quiet for 3s + all tools resolved" turn-complete check?** A simpler "file stopped growing for 2s" check fires prematurely during slow tool calls (e.g., a Bash that takes 10s). Tracking unresolved tool IDs and requiring both signals avoids posting partial turns.
+- **Why eager-render AskUserQuestion instead of pairing it?** Every other tool is rendered when its `tool_result` arrives (milliseconds later). AskUserQuestion *blocks Claude until the user answers*, so its result only appears after the answer — pairing would hide the question forever. It's special-cased to render on `tool_use` (with an @mention + buttons) and tracked separately so the eventual result shows as the chosen answer, not a re-render.
+- **Why bind channels to session_id, not PID?** PIDs are ephemeral — they change on any in-place restart and all die on reboot. Binding the channel↔terminal mapping to the durable `session_id` lets the watcher rebind to a session's new PID instead of deleting the channel, and lets the bot resume tabs after a reboot. This single change fixed channels dying mid-question, the reboot wipe, and duplicate messages (two mirror loops on one session) at once.
 
 ## License
 
