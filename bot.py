@@ -2339,6 +2339,9 @@ async def on_ready():
         attached_pids[ch_id] = pid
         seen_pids.add(pid)
         ALLOWED_CHANNELS.add(ch_id)
+        # Persist session identity so this channel is restorable on the NEXT
+        # reboot (older rows attached pre-session_id only stored attached_pid).
+        sessions.set_identity(ch_id, info.session_id, info.cwd)
         jsonl = session_jsonl_path(info.cwd, info.session_id)
         if jsonl.is_file():
             label = info.name or info.session_id[:8]
