@@ -9,9 +9,12 @@ from pathlib import Path
 from typing import Dict, Optional
 
 # Force stdout to UTF-8 so emoji / arrows in print() don't blow up on Windows cp1252.
+# Also force line-buffered (write=line_buffering=True) so bot.log shows print() output
+# as it happens — pythonw.exe's default block buffering means logs never flush to disk
+# until shutdown, which makes mid-run debugging impossible.
 try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 except Exception:
     pass
 
@@ -1446,14 +1449,20 @@ async def _render_piece(
         if name == "AskUserQuestion":
             # Eager render with @mention so the user actually notices the
             # blocking prompt and can answer it.
+            print(f"  [mirror] eager-rendering AskUserQuestion tid={tid} to channel {channel.id}")
             preview = _format_tool_input(name, data["input"])
             primary = next(iter(ALLOWED_USERS), None)
             ping = f"<@{primary}> " if primary else ""
-            await send_chunked(
-                channel,
-                f"{ping}❓ **Claude needs your input** — reply with the option number:"
-                f"{preview}",
-            )
+            try:
+                await send_chunked(
+                    channel,
+                    f"{ping}❓ **Claude needs your input** — reply with the option number:"
+                    f"{preview}",
+                )
+                print(f"  [mirror] AskUserQuestion render succeeded for tid={tid}")
+            except Exception as e:
+                print(f"  [mirror] AskUserQuestion render FAILED for tid={tid}: {type(e).__name__}: {e}")
+                raise
             if tid:
                 pickers_rendered.add(tid)
             return
