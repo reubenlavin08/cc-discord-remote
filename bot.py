@@ -118,6 +118,26 @@ def _terminal_category(guild):
     return None
 
 
+_HEX8_RE = re.compile(r"^[0-9a-f]{8}$")
+
+
+def _bot_deletable(chan) -> bool:
+    """True only for channels the bot is allowed to auto-delete: those under the
+    `terminal` category, or legacy hex-id-named orphans it created. Protects
+    human channels (notifications, control-room, physics, etc.) — the bot must
+    never delete a channel it didn't create, even if it somehow got tracked."""
+    if chan is None:
+        return False
+    if chan.id in CONTROL_CHANNELS:
+        return False
+    cat = getattr(chan, "category", None)
+    if cat is not None and cat.name.lower() == TERMINAL_CATEGORY_NAME.lower():
+        return True
+    if _HEX8_RE.match(getattr(chan, "name", "") or ""):
+        return True
+    return False
+
+
 def _format_tool_input(tool_name: str, tool_input: dict) -> str:
     """One-line preview of what a tool is doing. AskUserQuestion is multi-line."""
     if tool_name == "Bash":
@@ -1946,6 +1966,13 @@ async def _pid_watcher(interval: float = 15.0):
                     sessions.conn.commit()
                     continue
 
+                if not _bot_deletable(chan):
+                    # Human channel (notifications etc.) that got tracked — untrack,
+                    # never delete.
+                    attached_pids.pop(ch_id, None)
+                    sessions.set_attached_pid(ch_id, None)
+                    continue
+
                 try:
                     await chan.send(f"🪦 Terminal exited (PID {pid} gone) — closing this channel.")
                 except Exception:
@@ -2185,6 +2212,53 @@ async def _resume_into_existing_channel(chan, ch_id: int, session_id: str, cwd: 
     return True
 
 
+async def _adopt_orphan_live_sessions():
+    """Create channels for live, NAMED claude sessions that have no Discord
+    channel — e.g. sessions that were alive through a reboot but whose channels
+    were deleted. Without this they'd stay invisible (the auto-spawn watcher
+    seeds already-running PIDs as 'seen' on its first pass and never makes them
+    a channel)."""
+    primary_user = next(iter(ALLOWED_USERS), 0)
+    guild = None
+    for cid in CONTROL_CHANNELS:
+        ch = bot.get_channel(cid)
+        if ch and getattr(ch, "guild", None):
+            guild = ch.guild
+            break
+    if guild is None:
+        return
+    attached_now = set(attached_pids.values())
+    adopted_sids: set = set()
+    for c in list_running():
+        if c.pid in attached_now:
+            adopted_sids.add(c.session_id)
+            continue
+        if not c.name:
+            continue  # skip throwaway/unnamed sessions
+        if c.session_id in adopted_sids:
+            continue
+        adopted_sids.add(c.session_id)
+        _auto_spawn_seen.add(c.pid)  # keep the auto-spawn watcher from double-creating
+        channel_name = _sanitize_channel_name(c.name or c.session_id[:8])
+        try:
+            new_chan = await guild.create_text_channel(
+                name=channel_name, category=_terminal_category(guild)
+            )
+        except discord.Forbidden:
+            print("  adopt: missing Manage Channels")
+            return
+        except discord.HTTPException as e:
+            print(f"  adopt: couldn't create channel for PID {c.pid}: {e}")
+            continue
+        ALLOWED_CHANNELS.add(new_chan.id)
+        try:
+            await cmd_attach(new_chan, new_chan.id, primary_user, str(c.pid))
+            print(f"  adopted live session #{channel_name} (PID {c.pid})")
+        except Exception as e:
+            print(f"  adopt: attach failed for PID {c.pid}: {e}")
+        await asyncio.sleep(1)
+
+
 async def _restore_terminals_on_boot():
     """After a reboot every claude.exe died. For each channel with a resumable
     session_id but no live process, resume it and re-attach to the SAME channel.
@@ -2290,6 +2364,12 @@ async def on_ready():
             # Discord channel already gone — just clean the DB row.
             sessions.conn.execute("DELETE FROM sessions WHERE channel_id = ?", (ch_id,))
             continue
+        if not _bot_deletable(chan):
+            # Not a bot-managed channel (e.g. notifications, a human channel that
+            # somehow got tracked). Stop tracking it but NEVER delete it.
+            sessions.conn.execute("DELETE FROM sessions WHERE channel_id = ?", (ch_id,))
+            print(f"  untracking non-managed channel {ch_id} (#{getattr(chan,'name','?')}) — not deleting")
+            continue
         try:
             await chan.delete(reason="cc-discord-remote: orphaned, no attached terminal")
             sessions.conn.execute("DELETE FROM sessions WHERE channel_id = ?", (ch_id,))
@@ -2307,6 +2387,7 @@ async def on_ready():
     async def _boot_then_replay():
         try:
             await _restore_terminals_on_boot()
+            await _adopt_orphan_live_sessions()
         finally:
             await _replay_offline_messages()
     asyncio.create_task(_boot_then_replay())

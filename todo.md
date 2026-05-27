@@ -22,6 +22,11 @@ Tracks every request Reuben has made for the Discord remote-control bot, with st
 - AskUserQuestion eager-render (`701a402`) + line-buffered bot.log (`427cfc8`) — render confirmed working in bot.log; auto-close was the real bug (now fixed).
 - Esc-before-type + picker-aware skip (`a263f94`); resume auto-Enter + auto-look (`f157b7f`); offline replay (`09453e6`).
 
+## ✅ Done — channel protection + live-session adoption
+- **Never delete human channels** — `_bot_deletable()` guard: bot only auto-deletes channels under the `terminal` category or hex-id orphans. `notifications`, `control-room`, `physics` etc. are untracked-but-never-deleted. Fixes the reboot deleting the notifications channel.
+- **Adopt orphan live sessions on boot** — `_adopt_orphan_live_sessions()` gives a fresh channel to live NAMED sessions that lost theirs (survived a reboot but channel was deleted). Fixes "Discord hasn't repopulated" for still-running tabs.
+
 ## ❌ Still open
 - **Catchup doesn't press Enter** — couldn't reproduce from code (`_write_text` DOES append Enter). NEEDS a concrete repro from Reuben (which message, what he saw).
-- **First-restart priming** — currently-live channels (sensor, personalclaw) were attached with OLD code so their DB rows lack session_id. The restart deploying this will re-attach them and persist session_id; only reboots AFTER that are fully restorable.
+- **Channels lost in the PAST reboot** — ones already deleted with no session_id are gone as their original channels; the still-LIVE ones get fresh channels via adoption on the next restart.
+- **First-restart priming** — pre-existing channels attached with OLD code lack session_id; the deploying restart re-attaches + persists it, so only reboots AFTER that are fully restorable.
