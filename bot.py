@@ -841,6 +841,9 @@ async def cmd_attach(channel, channel_id, user_id, query: str):
 
     attached_pids[channel_id] = match.pid
     sessions.set_attached_pid(channel_id, match.pid)
+    # Persist the session identity too (not just the ephemeral PID) so this
+    # channel can be resumed after a reboot. See _restore_terminals_on_boot.
+    sessions.set_identity(channel_id, match.session_id, match.cwd)
     label = match.name or match.session_id[:8]
 
     # Start the bidirectional mirror: anything Claude writes to this session's JSONL —
@@ -1898,6 +1901,32 @@ async def _pid_watcher(interval: float = 15.0):
                 if pid_alive(pid):
                     continue
 
+                # Before treating this as a terminal exit: the SAME session may
+                # be alive under a NEW pid (an in-place Claude restart keeps the
+                # session_id but changes the process). Rebind instead of closing —
+                # this is what stops channels (and AskUserQuestion pickers) from
+                # dying when the pid number changes out from under us.
+                session_id, sess_cwd = sessions.get(ch_id)
+                if session_id:
+                    live = find_live_session(session_id)
+                    new_pid = live.get("pid") if live else None
+                    if new_pid and new_pid != pid and pid_alive(new_pid):
+                        old_mt = mirror_tasks.pop(ch_id, None)
+                        if old_mt and not old_mt.done():
+                            old_mt.cancel()
+                        attached_pids[ch_id] = new_pid
+                        sessions.set_attached_pid(ch_id, new_pid)
+                        chan = bot.get_channel(ch_id)
+                        jsonl = session_jsonl_path(sess_cwd, session_id)
+                        if chan is not None and jsonl.is_file():
+                            label = live.get("name") or session_id[:8]
+                            primary = next(iter(ALLOWED_USERS), 0)
+                            mirror_tasks[ch_id] = asyncio.create_task(
+                                _mirror_loop(chan, ch_id, primary, jsonl, jsonl.stat().st_size, label)
+                            )
+                        print(f"  rebound channel {ch_id}: PID {pid} -> {new_pid} (session {session_id[:8]})")
+                        continue
+
                 # Cancel mirror task immediately — it can't drive a dead process.
                 mt = mirror_tasks.pop(ch_id, None)
                 if mt and not mt.done():
@@ -2032,10 +2061,20 @@ async def _auto_spawn_watcher(interval: float = 15.0):
             now_ms = time.time() * 1000
             min_age_ms = AUTO_SPAWN_MIN_AGE_SECONDS * 1000
             already_attached = set(attached_pids.values())
+            # Session_ids that already have a channel. Skip a "new" PID whose
+            # session matches one of these — it's the same session under a new
+            # pid (in-place restart), which _pid_watcher will rebind to the
+            # existing channel. Creating a second channel here is what produced
+            # duplicate mirror loops (and duplicate Discord messages).
+            attached_sids = {
+                c.session_id for c in running
+                if c.pid in already_attached and c.session_id
+            }
             new_sessions = [
                 c for c in running
                 if c.pid not in _auto_spawn_seen
                 and c.pid not in already_attached
+                and c.session_id not in attached_sids
                 and (c.started_at_ms is None or now_ms - c.started_at_ms >= min_age_ms)
             ]
             if not new_sessions:
@@ -2085,6 +2124,105 @@ async def _auto_spawn_watcher(interval: float = 15.0):
             print(f"  _auto_spawn_watcher error (continuing): {e}")
 
 
+async def _resume_into_existing_channel(chan, ch_id: int, session_id: str, cwd: str, user_id: int) -> bool:
+    """Relaunch `claude --resume <session_id>` in `cwd` and attach the EXISTING
+    Discord channel `ch_id` to the new process. `claude --resume` forks a new
+    session_id, so we read it back from the session registry and update the DB
+    row, then attach. Returns True on success."""
+    before = _list_claude_pids()
+    try:
+        subprocess.Popen(
+            ["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-Command",
+             f"claude --resume {session_id}"],
+            creationflags=subprocess.CREATE_NEW_CONSOLE,
+            cwd=cwd,
+            close_fds=True,
+        )
+    except Exception as e:
+        print(f"  restore: couldn't launch resume for {session_id[:8]}: {e}")
+        return False
+
+    new_pid = None
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        await asyncio.sleep(1)
+        diff = _list_claude_pids() - before
+        if diff:
+            new_pid = max(diff)
+            break
+    if not new_pid:
+        print(f"  restore: no claude.exe appeared for {session_id[:8]}")
+        return False
+
+    _auto_spawn_seen.add(new_pid)
+    # Trust prompt + resume picker — two defensive Enters (see cmd_resume_spawn).
+    await asyncio.sleep(2)
+    await _run_console_helper(new_pid, "", mode="enter")
+    await asyncio.sleep(3)
+    await _run_console_helper(new_pid, "", mode="enter")
+
+    # Read back the NEW forked session_id from the registry so future rebinds work.
+    sessions_dir = Path.home() / ".claude" / "sessions"
+    new_sid = session_id
+    sdeadline = time.time() + 30
+    while time.time() < sdeadline:
+        await asyncio.sleep(0.5)
+        sj = sessions_dir / f"{new_pid}.json"
+        if sj.is_file():
+            try:
+                new_sid = json.loads(sj.read_text(encoding="utf-8")).get("sessionId", session_id)
+            except Exception:
+                pass
+            break
+
+    sessions.set_identity(ch_id, new_sid, cwd)
+    try:
+        await cmd_attach(chan, ch_id, user_id, str(new_pid))
+    except Exception as e:
+        print(f"  restore: attach failed for PID {new_pid}: {e}")
+        return False
+    print(f"  restored terminal: channel {ch_id} resumed {session_id[:8]} -> PID {new_pid} (new sid {new_sid[:8]})")
+    return True
+
+
+async def _restore_terminals_on_boot():
+    """After a reboot every claude.exe died. For each channel with a resumable
+    session_id but no live process, resume it and re-attach to the SAME channel.
+    Channels survive a reboot in Discord (the bot died before it could delete
+    them), so we reuse them — no channel churn, stable ids."""
+    primary_user = next(iter(ALLOWED_USERS), 0)
+    restored_sids: set = set()
+    for ch_id, session_id, cwd in sessions.all_resumable():
+        if ch_id in attached_pids:
+            restored_sids.add(session_id)
+            continue  # already live / re-attached by the on_ready restore loop
+        if session_id in restored_sids:
+            continue  # another channel already resumed this exact session
+        chan = bot.get_channel(ch_id)
+        if chan is None:
+            continue
+        if not cwd or cwd in ("?", "") or not Path(cwd).is_dir():
+            print(f"  restore: skipping channel {ch_id} — cwd {cwd!r} not present")
+            continue
+        restored_sids.add(session_id)
+        # If the session is somehow already live (e.g. user relaunched it), just attach.
+        live = find_live_session(session_id)
+        if live and pid_alive(live.get("pid")):
+            try:
+                await cmd_attach(chan, ch_id, primary_user, str(live["pid"]))
+                print(f"  restore: re-attached channel {ch_id} to live PID {live['pid']}")
+            except Exception as e:
+                print(f"  restore: re-attach failed for channel {ch_id}: {e}")
+            continue
+        try:
+            await chan.send("🔄 Restoring this terminal after reboot…")
+        except Exception:
+            pass
+        await _resume_into_existing_channel(chan, ch_id, session_id, cwd, primary_user)
+        # Stagger launches so a reboot with many tabs doesn't spawn N consoles at once.
+        await asyncio.sleep(2)
+
+
 @bot.event
 async def on_ready():
     print(f"Bot online as {bot.user}")
@@ -2119,11 +2257,10 @@ async def on_ready():
             continue
         info = find_by_pid(pid)
         if not info:
+            # PID is dead (almost always: the machine rebooted). Clear the stale
+            # pid but DON'T announce or delete — if this channel has a resumable
+            # session_id, _restore_terminals_on_boot will bring it back below.
             sessions.set_attached_pid(ch_id, None)
-            try:
-                await chan.send(f"⚠️ PID {pid} no longer running — attachment cleared on restart.")
-            except Exception:
-                pass
             continue
         attached_pids[ch_id] = pid
         seen_pids.add(pid)
@@ -2137,14 +2274,17 @@ async def on_ready():
             print(f"  restored attachment: channel {ch_id} -> PID {pid} ({label})")
 
     # Auto-delete orphaned channels: previously-tracked channels with no active attachment
-    # and no role as an env-configured control channel.
-    orphan_ids = [
-        r[0] for r in sessions.conn.execute(
-            "SELECT channel_id FROM sessions WHERE attached_pid IS NULL"
+    # and no role as an env-configured control channel. Channels with a resumable
+    # session_id are SKIPPED here — _restore_terminals_on_boot will bring them back.
+    orphan_rows = [
+        (r[0], r[1]) for r in sessions.conn.execute(
+            "SELECT channel_id, session_id FROM sessions WHERE attached_pid IS NULL"
         )
         if r[0] not in CONTROL_CHANNELS
     ]
-    for ch_id in orphan_ids:
+    for ch_id, session_id in orphan_rows:
+        if session_id:
+            continue  # resumable — leave it for the boot-restore task
         chan = bot.get_channel(ch_id)
         if chan is None:
             # Discord channel already gone — just clean the DB row.
@@ -2161,11 +2301,15 @@ async def on_ready():
             print(f"  couldn't auto-delete channel {ch_id}: {e}")
     sessions.conn.commit()
 
-    # Offline-message catchup: walk each tracked channel's history since the last
-    # message we processed, and run anything we missed while offline. Bot-authored
-    # messages and non-allowed senders are skipped; ordering is preserved by
-    # asking Discord for oldest-first history.
-    asyncio.create_task(_replay_offline_messages())
+    # Reboot restore: resume every channel that has a session_id but no live
+    # process, re-attaching to the SAME Discord channel. Runs first so that
+    # offline-replay (below) sees the restored attachments.
+    async def _boot_then_replay():
+        try:
+            await _restore_terminals_on_boot()
+        finally:
+            await _replay_offline_messages()
+    asyncio.create_task(_boot_then_replay())
 
     # Sync slash commands to each guild the allowed channels live in (instant per-guild).
     global _pid_watcher_started, _auto_spawn_watcher_started, _orphan_sweeper_started

@@ -101,6 +101,36 @@ class SessionStore:
             ).fetchall()
         ]
 
+    def set_identity(self, channel_id: int, session_id: Optional[str], cwd: str) -> None:
+        """Persist session_id + cwd WITHOUT clobbering attached_pid / last_msg_id.
+        Used so a live-attached channel can be resumed after a reboot (the PID is
+        ephemeral; the session_id is the durable identity)."""
+        existing = self.conn.execute(
+            "SELECT 1 FROM sessions WHERE channel_id = ?", (channel_id,)
+        ).fetchone()
+        if existing:
+            self.conn.execute(
+                "UPDATE sessions SET session_id = ?, cwd = ? WHERE channel_id = ?",
+                (session_id, cwd, channel_id),
+            )
+        else:
+            self.conn.execute(
+                "INSERT INTO sessions (channel_id, session_id, cwd) VALUES (?, ?, ?)",
+                (channel_id, session_id, cwd),
+            )
+        self.conn.commit()
+
+    def all_resumable(self) -> list:
+        """(channel_id, session_id, cwd) for every channel that has a session_id —
+        i.e. could be resumed via `claude --resume` after a reboot."""
+        return [
+            (r[0], r[1], r[2])
+            for r in self.conn.execute(
+                "SELECT channel_id, session_id, cwd FROM sessions "
+                "WHERE session_id IS NOT NULL AND session_id != ''"
+            ).fetchall()
+        ]
+
     # ---- offline-message replay --------------------------------------------
 
     def get_last_msg_id(self, channel_id: int) -> Optional[int]:
