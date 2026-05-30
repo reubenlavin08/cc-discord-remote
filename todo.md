@@ -26,6 +26,11 @@ Tracks every request Reuben has made for the Discord remote-control bot, with st
 - **Never delete human channels** — `_bot_deletable()` guard: bot only auto-deletes channels under the `terminal` category or hex-id orphans. `notifications`, `control-room`, `physics` etc. are untracked-but-never-deleted. Fixes the reboot deleting the notifications channel.
 - **Adopt orphan live sessions on boot** — `_adopt_orphan_live_sessions()` gives a fresh channel to live NAMED sessions that lost theirs (survived a reboot but channel was deleted). Fixes "Discord hasn't repopulated" for still-running tabs.
 
+## ✅ Done — duplicate-message root causes (2026-05-30)
+Reuben re-reported "same message twice" after prior fixes. Found TWO real causes (bot.log showed each AskUserQuestion rendered 4×/3×/2×, and DB showed two channels per session):
+- **`on_ready` re-runs on every gateway reconnect** — discord.py re-fires `on_ready` after every RESUME, and the restore/mirror block spawned a fresh `_mirror_loop` per channel each time without cancelling the old one. N reconnects → N mirror loops per channel → N copies of every message. Fixed with a one-time `_boot_done` guard (matches the existing watcher `_*_started` flags). The line `mirror_tasks[ch_id] = create_task(...)` overwrote the dict entry but left the old task alive — that was the leak.
+- **Two channels bound to one session** — `_restore_terminals_on_boot` re-attached OLD leftover channels to live PIDs the `on_ready` loop had already claimed (after `claude --resume` the session_id forks, so old/new channels share a live PID). Added a `claimed_pids` guard so a PID is never attached to two channels, plus `_dedup_session_channels()` which deletes the idle duplicate when a live sibling for the same session exists. Cleaned the two existing stale channels (remote-control + unity dupes) on restart; DB now one channel per session.
+
 ## ❌ Still open
 - **Catchup doesn't press Enter** — couldn't reproduce from code (`_write_text` DOES append Enter). NEEDS a concrete repro from Reuben (which message, what he saw).
 - **Channels lost in the PAST reboot** — ones already deleted with no session_id are gone as their original channels; the still-LIVE ones get fresh channels via adoption on the next restart.

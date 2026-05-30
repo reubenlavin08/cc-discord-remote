@@ -1966,6 +1966,7 @@ async def dispatch(channel, channel_id: int, user_id: int, text: str):
 _pid_watcher_started = False
 _auto_spawn_watcher_started = False
 _orphan_sweeper_started = False
+_boot_done = False  # on_ready re-fires on every gateway reconnect; restore must run once
 _auto_spawn_seen: set = set()  # PIDs we've already processed — populated on first poll
 
 
@@ -2374,6 +2375,49 @@ async def _sweep_duplicate_terminal_channels():
                 print(f"  couldn't sweep duplicate #{name} ({c.id}): {e}")
 
 
+async def _dedup_session_channels():
+    """If two+ channels share one session_id and one of them is currently attached
+    (live), the others are stale leftovers from a past reboot that resumed the
+    session into a fresh channel instead of reusing the old one. Delete the idle
+    duplicates (Discord channel + DB row) so each terminal has exactly ONE channel.
+
+    Why this matters: two channels on one session = the same terminal mirrored
+    twice = every message posted twice. Safe by construction — only deletes a
+    bot-managed channel when a LIVE sibling for that session exists; never touches
+    the attached channel, control channels, or human (non-deletable) channels."""
+    by_sid: Dict[str, list] = {}
+    for ch_id, sid in sessions.conn.execute(
+        "SELECT channel_id, session_id FROM sessions WHERE session_id IS NOT NULL AND session_id != ''"
+    ):
+        by_sid.setdefault(sid, []).append(ch_id)
+    changed = False
+    for sid, ch_ids in by_sid.items():
+        if len(ch_ids) < 2:
+            continue
+        keep = {c for c in ch_ids if c in attached_pids}
+        if not keep:
+            continue  # none live — don't guess which to keep
+        for ch_id in ch_ids:
+            if ch_id in keep or ch_id in CONTROL_CHANNELS:
+                continue
+            chan = bot.get_channel(ch_id)
+            if chan is not None and not _bot_deletable(chan):
+                sessions.conn.execute("DELETE FROM sessions WHERE channel_id = ?", (ch_id,))
+                changed = True
+                continue  # human channel that shares a session — untrack, never delete
+            if chan is not None:
+                try:
+                    await chan.delete(reason="cc-discord-remote: duplicate channel for live session")
+                    print(f"  dedup: deleted duplicate channel {ch_id} for live session {sid[:8]}")
+                except Exception as e:
+                    print(f"  dedup: couldn't delete {ch_id}: {e}")
+            sessions.conn.execute("DELETE FROM sessions WHERE channel_id = ?", (ch_id,))
+            ALLOWED_CHANNELS.discard(ch_id)
+            changed = True
+    if changed:
+        sessions.conn.commit()
+
+
 async def _restore_terminals_on_boot():
     """After a reboot every claude.exe died. For each channel with a resumable
     session_id but no live process, resume it and re-attach to the SAME channel.
@@ -2381,6 +2425,19 @@ async def _restore_terminals_on_boot():
     them), so we reuse them — no channel churn, stable ids."""
     primary_user = next(iter(ALLOWED_USERS), 0)
     restored_sids: set = set()
+    # Seed from channels the on_ready restore loop already attached, so we don't
+    # re-attach a SECOND (old, leftover) channel to a session/PID that's already
+    # claimed. After `claude --resume` the session_id forks, so an old channel's
+    # stored session_id can differ from the live one while pointing at the SAME
+    # live PID — hence we guard on the PID, not just the session_id. Two channels
+    # mirroring one terminal = every message posted twice (the duplicate bug).
+    claimed_pids: set = set(attached_pids.values())
+    for a_ch_id in list(attached_pids.keys()):
+        row = sessions.conn.execute(
+            "SELECT session_id FROM sessions WHERE channel_id = ?", (a_ch_id,)
+        ).fetchone()
+        if row and row[0]:
+            restored_sids.add(row[0])
     for ch_id, session_id, cwd in sessions.all_resumable():
         if ch_id in CONTROL_CHANNELS:
             continue  # command room (SDK channel), not a terminal — never resume
@@ -2406,9 +2463,16 @@ async def _restore_terminals_on_boot():
         # If the session is somehow already live (e.g. user relaunched it), just attach.
         live = find_live_session(session_id)
         if live and pid_alive(live.get("pid")):
+            live_pid = live["pid"]
+            if live_pid in claimed_pids:
+                # Another channel is already mirroring this exact terminal. Attaching
+                # here too would double every message. Leave this leftover channel idle.
+                print(f"  restore: PID {live_pid} already attached elsewhere — not re-attaching channel {ch_id}")
+                continue
             try:
-                await cmd_attach(chan, ch_id, primary_user, str(live["pid"]))
-                print(f"  restore: re-attached channel {ch_id} to live PID {live['pid']}")
+                await cmd_attach(chan, ch_id, primary_user, str(live_pid))
+                claimed_pids.add(live_pid)
+                print(f"  restore: re-attached channel {ch_id} to live PID {live_pid}")
             except Exception as e:
                 print(f"  restore: re-attach failed for channel {ch_id}: {e}")
             continue
@@ -2423,15 +2487,27 @@ async def _restore_terminals_on_boot():
 
 @bot.event
 async def on_ready():
+    global _boot_done, _pid_watcher_started, _auto_spawn_watcher_started, _orphan_sweeper_started
     print(f"Bot online as {bot.user}")
     print(f"  allowed users:    {sorted(ALLOWED_USERS) or '(none — bot will reject everyone)'}")
     print(f"  allowed channels: {sorted(ALLOWED_CHANNELS) or '(any)'}")
     print(f"  default cwd:      {DEFAULT_CWD}")
 
     # Every channel we've ever tracked stays in the allowlist — even orphaned ones —
-    # so the user can always run `!cc close` to clean them up.
+    # so the user can always run `!cc close` to clean them up. Idempotent; safe to
+    # re-run on every reconnect.
     for row in sessions.conn.execute("SELECT channel_id FROM sessions"):
         ALLOWED_CHANNELS.add(row[0])
+
+    # on_ready fires again after every gateway RESUME/reconnect — NOT just at launch.
+    # The restore/mirror-spawn block below starts one _mirror_loop per channel; on a
+    # reconnect those loops are still alive in memory, so re-running it would spawn a
+    # SECOND (third, …) mirror per channel and every terminal message would be posted
+    # twice (the exact "duplicate messages on Discord" bug). Run it once per process.
+    if _boot_done:
+        print("  (reconnect — boot restore already done; mirrors still running)")
+        return
+    _boot_done = True
 
     # Restore persisted per-channel attachments (channels spawned in earlier sessions).
     # Enforce one-channel-per-PID: keep the first occurrence, clear the rest.
@@ -2515,13 +2591,13 @@ async def on_ready():
         try:
             await _restore_terminals_on_boot()
             await _adopt_orphan_live_sessions()
+            await _dedup_session_channels()
             await _sweep_duplicate_terminal_channels()
         finally:
             await _replay_offline_messages()
     asyncio.create_task(_boot_then_replay())
 
     # Sync slash commands to each guild the allowed channels live in (instant per-guild).
-    global _pid_watcher_started, _auto_spawn_watcher_started, _orphan_sweeper_started
     if not _pid_watcher_started:
         _pid_watcher_started = True
         asyncio.create_task(_pid_watcher())
