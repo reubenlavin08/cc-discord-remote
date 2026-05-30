@@ -1760,6 +1760,36 @@ async def _mirror_loop(channel, channel_id: int, user_id: int, jsonl_path: Path,
             pass
 
 
+# Claude Code shows "Compacting conversation…" (and a "/compact" affordance) while
+# it compacts — auto-triggered when you resume a near-full session, or from a manual
+# /compact. Typing into that busy input doesn't wait: the keystrokes land on the
+# in-progress /compact line and the message comes out as `/compact "your message"`.
+_COMPACTING_RE = re.compile(r"compacting\b", re.IGNORECASE)
+
+
+async def _wait_while_compacting(channel, pid: int, max_wait: float = 240.0) -> None:
+    """Hold until Claude Code is done compacting, so the message reaches a clean
+    prompt instead of being appended to the running /compact command."""
+    screen = await _run_console_helper(pid, "", mode="look")
+    if not _COMPACTING_RE.search(screen):
+        return
+    try:
+        await channel.send("⏳ Claude is compacting — holding your message until it finishes…")
+    except Exception:
+        pass
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        await asyncio.sleep(2.0)
+        screen = await _run_console_helper(pid, "", mode="look")
+        if not _COMPACTING_RE.search(screen):
+            await asyncio.sleep(1.0)  # let the prompt redraw/settle after compaction
+            return
+    try:
+        await channel.send("⚠️ Still compacting after a while — sending your message anyway.")
+    except Exception:
+        pass
+
+
 async def cmd_terminal_send(channel, channel_id, user_id, text: str):
     """Type text into the attached terminal. The mirror loop posts Claude's response."""
     pid = attached_pids.get(channel_id)
@@ -1780,6 +1810,13 @@ async def cmd_terminal_send(channel, channel_id, user_id, text: str):
     # a network roundtrip (e.g. /login) or render an interactive picker.
     is_slash = text.lstrip().startswith("/")
     mode = "send" if is_slash else "type"
+
+    # If Claude Code is mid-compaction (common right after a resume), wait for it
+    # to finish before typing — otherwise the message gets appended to the running
+    # /compact and arrives as `/compact "the message"`. A real /compact command the
+    # user sent on purpose still goes through (we only HOLD when already compacting).
+    if not is_slash:
+        await _wait_while_compacting(channel, pid)
 
     async with channel.typing():
         # Dismiss any TUI menu (e.g. /usage output, picker, dialog) that would
