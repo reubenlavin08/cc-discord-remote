@@ -37,7 +37,16 @@ Reuben re-reported "same message twice" after prior fixes. Found TWO real causes
 ## ✅ Done — reboot-restore was dropping sessions with stale session_ids (2026-05-30)
 Reuben: "after reboot it should always resume full session as is." Audit found the DB had stale session_ids — 5 of 6 tracked sessions stored an id with NO JSONL on disk, so `_restore_terminals_on_boot`'s `session_jsonl_path(...).is_file()` check would fail and silently SKIP them on reboot. Cause: Claude Code advances/forks the session_id as a conversation grows (resume, auto-compaction) and the terminals had restarted into new PIDs/sids since the last bot boot, but `_pid_watcher` only synced state when a PID *died* — never re-pinned the DB for a still-live PID. Fix: in `_pid_watcher`, for every LIVE attached PID, read the current sid from the registry (`list_running()`) and `set_identity` if it drifted (skips CONTROL_CHANNELS). Now the DB always points at the real current conversation; verified all 6 sessions DB-sid == live-sid == JSONL-exists. NOTE: `claude --resume` always forks a NEW sid (content identical, id new) — unavoidable Claude Code behavior; and resuming a near-full session triggers auto-compaction. So "as is" = full history restored, not a byte-identical session id.
 
+## ✅ Done — reboot resumes FULL session + handles slow startup (2026-05-30)
+Reuben: "always resume full session as is"; after a reboot one tab was stuck. Root causes:
+- The resume picker Claude Code shows for big sessions defaults to **"Resume from summary (recommended)"** (lossy). The old restore flow sent a blind Enter → it was resuming from SUMMARY, not full. Now `_drive_resume_startup()` explicitly sends Down+Enter to pick "Resume full session as-is".
+- Blind fixed-sleep Enters miss the prompt when a slow reboot (pihole/DNS lag) delays startup → tab stuck on the picker/trust screen. New helper POLLS the screen up to 90s, accepting the trust prompt and the resume picker whenever they actually appear. Wired into all 3 launch sites (cmd_resume_spawn, cmd_launch, _resume_into_existing_channel). Unstuck the 2 live stuck tabs (personalclaw, PiHole) manually via Down+Enter.
+
+## ❌ Won't do — Windows Terminal tabs (2026-05-30)
+Reuben wanted resumed sessions combined into ONE tabbed window instead of N PowerShell windows. **Empirically tested and impossible**: WT hosts shells via ConPTY, and `AttachConsole(<wt-tab-pid>)` fails with Win32 err 87 — the whole remote-control depends on AttachConsole + WriteConsoleInput into a CLASSIC console. Confirmed with a throwaway tab. Fallback offered: launch the windows MINIMIZED (declutter, attach still works) — pending Reuben's confirm.
+
 ## ❌ Still open
 - **Catchup doesn't press Enter** — couldn't reproduce from code (`_write_text` DOES append Enter). NEEDS a concrete repro from Reuben (which message, what he saw).
+- **Minimized resume windows** — offered as the WT-tabs fallback; awaiting Reuben's yes/no before changing launch behavior.
 - **Channels lost in the PAST reboot** — ones already deleted with no session_id are gone as their original channels; the still-LIVE ones get fresh channels via adoption on the next restart.
 - **First-restart priming** — pre-existing channels attached with OLD code lack session_id; the deploying restart re-attaches + persists it, so only reboots AFTER that are fully restorable.

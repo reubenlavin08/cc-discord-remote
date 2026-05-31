@@ -323,6 +323,45 @@ def _list_claude_pids() -> set:
     return pids
 
 
+async def _drive_resume_startup(pid: int, max_wait: float = 90.0) -> str:
+    """Walk a freshly-launched claude through its startup prompts so the session
+    ends up actually resumed — and FULL, not summarized.
+
+    Two gated prompts can appear, and a slow machine (DNS/pihole lag after a reboot)
+    can push them well past any fixed sleep — which is exactly how a tab gets stuck:
+      1. Trust prompt ("Do you trust the files in this folder?") — accept (Enter).
+      2. Resume picker — its DEFAULT highlight is "Resume from summary (recommended)",
+         which is lossy. We want the full conversation, so move Down one and confirm
+         (Down, Enter) to select "Resume full session as-is".
+
+    Polls the screen (instead of sleeping blindly) until both are handled or the
+    ready prompt/statusline appears. Brand-new launches have no resume picker — the
+    trust branch fires, then it detects ready and returns. Returns a status string.
+    """
+    deadline = time.time() + max_wait
+    did_trust = False
+    did_resume = False
+    while time.time() < deadline:
+        screen = (await _run_console_helper(pid, "", mode="look")).lower()
+        if not did_trust and ("do you trust" in screen or "trust the files" in screen):
+            await _run_console_helper(pid, "", mode="enter")  # accept trust (default: yes)
+            did_trust = True
+            await asyncio.sleep(1.5)
+            continue
+        if not did_resume and "resume full session" in screen and "enter to confirm" in screen:
+            # Default highlight is option 1 (summary); Down -> option 2 (full), Enter confirms.
+            await _run_console_helper(pid, "down,enter", mode="keys")
+            did_resume = True
+            await asyncio.sleep(1.5)
+            continue
+        # Ready: the normal prompt is up. Custom statusline shows "ctx N%"; Claude's
+        # footer shows "shift+tab to cycle". Either means startup prompts are done.
+        if "shift+tab to cycle" in screen or re.search(r"ctx\s+\d+%", screen):
+            break
+        await asyncio.sleep(1.0)
+    return f"trust={did_trust} full_resume={did_resume}"
+
+
 async def cmd_resume_spawn(channel, user_id: int, s):
     """Spawn `claude --resume <id>` in a new console, make a new Discord channel, attach it."""
     if not channel.guild:
@@ -371,16 +410,9 @@ async def cmd_resume_spawn(channel, user_id: int, s):
     # create a duplicate hex-id channel for the same terminal.
     _auto_spawn_seen.add(new_pid)
 
-    # Defensive Enter in case a trust prompt rendered.
+    # Walk trust + resume prompts, picking FULL resume (not the summary default).
     await asyncio.sleep(2)
-    await _run_console_helper(new_pid, "", mode="enter")
-
-    # Second defensive Enter for the "Resume from summary / full / don't ask"
-    # picker that Claude Code shows for old or large sessions. Default
-    # selection is "Resume from summary (recommended)", so a plain Enter picks
-    # it. Harmless if no picker is up — Claude's prompt ignores empty submits.
-    await asyncio.sleep(3)
-    await _run_console_helper(new_pid, "", mode="enter")
+    await _drive_resume_startup(new_pid)
 
     # Wait for the session JSON — this will hold the NEW forked session_id Claude assigned.
     session_deadline = time.time() + 30
@@ -1147,9 +1179,9 @@ async def cmd_launch(channel, user_id: int, args: str):
     # during the ~5-10 s it takes us to finish trust prompt + /rename + attach.
     _auto_spawn_seen.add(new_pid)
 
-    # Give the trust prompt a moment to render, then accept it with Enter.
+    # Accept the trust prompt (screen-aware, so a slow startup doesn't leave it stuck).
     await asyncio.sleep(2)
-    await _run_console_helper(new_pid, "", mode="enter")
+    await _drive_resume_startup(new_pid)
 
     # NOW wait for the session JSON to register (trust accepted, claude initialised).
     session_deadline = time.time() + 30
@@ -2308,11 +2340,12 @@ async def _resume_into_existing_channel(chan, ch_id: int, session_id: str, cwd: 
         return False
 
     _auto_spawn_seen.add(new_pid)
-    # Trust prompt + resume picker — two defensive Enters (see cmd_resume_spawn).
+    # Walk trust + resume prompts. Picks "Resume full session as-is" (NOT the summary
+    # default) and polls the screen, so a slow post-reboot startup doesn't leave the
+    # tab stuck on the picker. This is what makes reboot = "full session as is".
     await asyncio.sleep(2)
-    await _run_console_helper(new_pid, "", mode="enter")
-    await asyncio.sleep(3)
-    await _run_console_helper(new_pid, "", mode="enter")
+    status = await _drive_resume_startup(new_pid)
+    print(f"  restore: startup for {session_id[:8]} -> {status}")
 
     # Read back the NEW forked session_id from the registry so future rebinds work.
     sessions_dir = Path.home() / ".claude" / "sessions"
