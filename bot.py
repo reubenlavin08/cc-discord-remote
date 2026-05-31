@@ -2028,8 +2028,23 @@ async def _pid_watcher(interval: float = 15.0):
                 if pid is not None:
                     tracked.setdefault(ch_id, pid)
 
+            live_by_pid = {c.pid: c for c in list_running()}
             for ch_id, pid in tracked.items():
                 if pid_alive(pid):
+                    # Keep the persisted session_id pinned to the live process's
+                    # CURRENT session. Claude Code advances/forks the session_id as a
+                    # conversation grows (resume, auto-compaction); if the DB holds an
+                    # older id, reboot-restore runs `claude --resume <stale-id>`, the
+                    # on-disk JSONL check fails, and the session is silently dropped.
+                    # Re-pinning every pass means a reboot always resumes the real,
+                    # current conversation — "full session as is".
+                    if ch_id not in CONTROL_CHANNELS:
+                        live = live_by_pid.get(pid)
+                        if live and live.session_id and live.session_id != "?":
+                            stored_sid, stored_cwd = sessions.get(ch_id)
+                            if live.session_id != stored_sid:
+                                sessions.set_identity(ch_id, live.session_id, live.cwd or stored_cwd)
+                                print(f"  sync: channel {ch_id} sid {str(stored_sid)[:8]} -> {live.session_id[:8]}")
                     continue
 
                 # Before treating this as a terminal exit: the SAME session may
