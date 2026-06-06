@@ -9,3 +9,5 @@ bot.log
 bot.log.old
 bot.err.log
 bot.err.log.old
+close-markers/
+outbox/

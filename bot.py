@@ -63,6 +63,7 @@ HELP_TEXT = (
     f"`{PREFIX} attach <name>` — drive that terminal from this channel\n"
     f"`{PREFIX} detach` — stop driving the terminal\n"
     f"`{PREFIX} look` — snapshot the terminal screen\n"
+    f"`{PREFIX} get <path>` — upload a file from the session's folder back to Discord (e.g. `{PREFIX} get notes.txt`)\n"
     f"`{PREFIX} pad` — pop a clickable keypad (arrows / Enter / Esc / Tab / 1-5 / Look) for the attached terminal\n"
     f"`{PREFIX} keys <seq>` — raw keys to the TUI (e.g. `down,down,enter`, `1`, `space,tab`)\n"
     f"**Tool-approval popups** auto-surface as Discord buttons (✅ Allow / ❌ Deny / 💬 Deny + tell Claude).\n\n"
@@ -81,7 +82,20 @@ sessions = SessionStore("sessions.db", DEFAULT_CWD)
 active_turns: Dict[int, asyncio.Task] = {}  # channel_id → currently-running SDK turn
 attached_pids: Dict[int, int] = {}  # channel_id → live claude.exe PID (in-memory only)
 mirror_tasks: Dict[int, asyncio.Task] = {}  # channel_id → bg JSONL-tail task
+_auto_resume_attempts: Dict[int, int] = {}  # channel_id → failed auto-resume tries (death path)
+AUTO_RESUME_MAX_ATTEMPTS = 3  # give up + close after this many failed resumes (avoid window storm)
+_last_channel_rename: Dict[int, float] = {}  # channel_id → time.time() of last name sync
+# Discord rate-limits channel renames to 2 per 10 min per channel (and discord.py BLOCKS
+# on the limit, which would stall the watcher). A 10-min cooldown keeps us to 1/10min.
+CHANNEL_RENAME_COOLDOWN = 600.0
+_session_shell_pid: Dict[int, int] = {}  # claude pid → its parent PowerShell pid (for /exit detection)
 CONSOLE_HELPER = str(Path(__file__).parent / "console_helper.py")
+# Drop-a-file close signal: the `/cc-close` slash command (via cc_close.ps1) writes
+# close-markers/<claude_pid>; _close_marker_watcher acts on it within ~2s.
+CLOSE_MARKER_DIR = Path(__file__).parent / "close-markers"
+# Outbox: `/cc-send <file>` (via cc_send.ps1) copies a file to outbox/<claude_pid>__<name>;
+# _outbox_watcher uploads it to that session's Discord channel, then deletes it.
+OUTBOX_DIR = Path(__file__).parent / "outbox"
 
 
 # ---------- helpers ---------------------------------------------------------
@@ -323,13 +337,52 @@ def _list_claude_pids() -> set:
     return pids
 
 
+def _spawn_session_window(inner_cmd: str, cwd: Optional[str], title: Optional[str] = None) -> None:
+    """Launch a Claude session as a TAB in the existing Windows Terminal window.
+
+    `wt -w 0 new-tab` adds a tab to the current WT window (creating one if none
+    exists), so every session lands in ONE tabbed window instead of N scattered
+    standalone windows. The bot drives WT-hosted tabs exactly like standalone
+    consoles — AttachConsole / ReadConsoleOutputCharacterW / WriteConsoleInputW all
+    operate on the console buffer regardless of WT hosting (verified 2026-05-31 by
+    scraping + injecting into the WT-hosted remote-control session).
+
+    Falls back to a standalone console if wt.exe is missing or errors, so launching
+    never breaks if Windows Terminal isn't available.
+    """
+    inner = ["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-Command", inner_cmd]
+    use_cwd = cwd if (cwd and cwd not in ("?", "") and Path(cwd).is_dir()) else None
+    # wt.exe is a Windows App Execution Alias; bare "wt.exe" isn't on the bot's
+    # (pythonw, scheduled-task) PATH, so resolve the full WindowsApps alias path —
+    # CreateProcess launches it fine by absolute path even though PATH lookup fails.
+    wt = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps", "wt.exe")
+    if os.path.isfile(wt):
+        wt_args = [wt, "-w", "0", "new-tab"]
+        if use_cwd:
+            wt_args += ["-d", use_cwd]
+        if title:
+            wt_args += ["--title", title]
+        wt_args += inner
+        try:
+            subprocess.Popen(wt_args, close_fds=True)
+            return
+        except Exception as e:
+            print(f"  wt launch failed ({type(e).__name__}: {e}); standalone console fallback")
+    else:
+        print(f"  wt.exe not found at {wt}; standalone console fallback")
+    subprocess.Popen(inner, creationflags=subprocess.CREATE_NEW_CONSOLE,
+                     cwd=use_cwd, close_fds=True)
+
+
 async def _drive_resume_startup(pid: int, max_wait: float = 90.0) -> str:
     """Walk a freshly-launched claude through its startup prompts so the session
     ends up actually resumed — and FULL, not summarized.
 
     Two gated prompts can appear, and a slow machine (DNS/pihole lag after a reboot)
     can push them well past any fixed sleep — which is exactly how a tab gets stuck:
-      1. Trust prompt ("Do you trust the files in this folder?") — accept (Enter).
+      1. Trust prompt — accept (Enter). v2.1.158 reworded this to
+         "Quick safety check: Is this a project you created or one you trust?" /
+         "Yes, I trust this folder"; older builds said "Do you trust the files…".
       2. Resume picker — its DEFAULT highlight is "Resume from summary (recommended)",
          which is lossy. We want the full conversation, so move Down one and confirm
          (Down, Enter) to select "Resume full session as-is".
@@ -337,19 +390,32 @@ async def _drive_resume_startup(pid: int, max_wait: float = 90.0) -> str:
     Polls the screen (instead of sleeping blindly) until both are handled or the
     ready prompt/statusline appears. Brand-new launches have no resume picker — the
     trust branch fires, then it detects ready and returns. Returns a status string.
+
+    Trust detection is deliberately strict: it matches a full prompt phrase AND the
+    live "enter to confirm" menu affordance TOGETHER. A restored transcript can quote
+    words like "trust" in the conversation body — the loose substring match this used
+    to do ("do you trust") false-fired on that text and sent a stray Enter into the
+    ready prompt. Requiring the interactive-menu footer scopes it to the real screen.
     """
+    # Full prompt phrases (not loose substrings) so transcript text can't match.
+    trust_phrases = ("do you trust the files", "quick safety check",
+                     "yes, i trust this folder")
     deadline = time.time() + max_wait
     did_trust = False
     did_resume = False
     while time.time() < deadline:
         screen = (await _run_console_helper(pid, "", mode="look")).lower()
-        if not did_trust and ("do you trust" in screen or "trust the files" in screen):
+        if (not did_trust and "enter to confirm" in screen
+                and any(p in screen for p in trust_phrases)
+                and "resume full session" not in screen):
             await _run_console_helper(pid, "", mode="enter")  # accept trust (default: yes)
             did_trust = True
             await asyncio.sleep(1.5)
             continue
         if not did_resume and "resume full session" in screen and "enter to confirm" in screen:
             # Default highlight is option 1 (summary); Down -> option 2 (full), Enter confirms.
+            # "down" goes out as a VT escape sequence (console_helper handles arrows that
+            # way for v2.1.158+, which ignores synthesized VK_DOWN key events).
             await _run_console_helper(pid, "down,enter", mode="keys")
             did_resume = True
             await asyncio.sleep(1.5)
@@ -382,13 +448,8 @@ async def cmd_resume_spawn(channel, user_id: int, s):
     await channel.send(f"🚀 Resuming `{short}` in `{cwd}`…")
 
     try:
-        subprocess.Popen(
-            ["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-Command",
-             f"claude --resume {s.session_id}"],
-            creationflags=subprocess.CREATE_NEW_CONSOLE,
-            cwd=cwd,
-            close_fds=True,
-        )
+        _spawn_session_window(f"claude --resume {s.session_id}", cwd,
+                              title=(s.custom_name or short))
     except Exception as e:
         await channel.send(f"⚠️ Couldn't launch: `{type(e).__name__}: {e}`")
         return
@@ -1147,12 +1208,7 @@ async def cmd_launch(channel, user_id: int, args: str):
     # Spawn in a new visible console. `claude` is a .ps1 script, so we need ExecutionPolicy
     # Bypass — subprocess-launched PowerShell can land on a restricted policy.
     try:
-        subprocess.Popen(
-            ["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-Command", "claude"],
-            creationflags=subprocess.CREATE_NEW_CONSOLE,
-            cwd=cwd,
-            close_fds=True,
-        )
+        _spawn_session_window("claude", cwd, title="claude")
     except Exception as e:
         await channel.send(f"⚠️ Couldn't launch: `{type(e).__name__}: {e}`")
         return
@@ -1268,6 +1324,187 @@ async def _close_terminal_for_pid(pid: int) -> str:
     return f"killed claude.exe {pid}; PowerShell parent unknown — window may persist"
 
 
+async def _close_session_cleanly(ch_id, claude_pid: int, shell_pid: int, reason: str) -> None:
+    """Tear a session down cleanly and permanently (no auto-resume, no re-channel).
+
+    `ch_id` may be None (an orphaned session with no channel) — we still kill it so a
+    close always closes the terminal. Order: mark CLOSING (so the reconciler can't
+    re-create a channel for it mid-teardown) + UNTRACK first; end claude and WAIT for it
+    to actually die (otherwise the reconciler sees a 'live session with no channel' and
+    re-adds one); send the `-NoExit` shell a graceful `exit` so WT closes the tab cleanly;
+    finally delete the Discord channel.
+    """
+    _closing_pids.add(claude_pid)
+    try:
+        if ch_id is not None:
+            mt = mirror_tasks.pop(ch_id, None)
+            if mt and not mt.done():
+                mt.cancel()
+            attached_pids.pop(ch_id, None)
+            _auto_resume_attempts.pop(ch_id, None)
+            try:
+                sessions.conn.execute("DELETE FROM sessions WHERE channel_id = ?", (ch_id,))
+                sessions.conn.commit()
+            except Exception:
+                pass
+            ALLOWED_CHANNELS.discard(ch_id)
+        _session_shell_pid.pop(claude_pid, None)
+
+        if claude_pid and pid_alive(claude_pid):
+            _kill_tree(claude_pid)  # ends claude + helper/bash it spawned; NOT the parent shell
+            for _ in range(20):     # wait up to ~4s for it to actually exit
+                if not pid_alive(claude_pid):
+                    break
+                await asyncio.sleep(0.2)
+        if shell_pid and pid_alive(shell_pid):
+            await asyncio.sleep(0.4)  # let the shell return to its prompt
+            try:
+                await _run_console_helper(shell_pid, "exit", mode="type")  # graceful → WT closes tab
+            except Exception:
+                pass
+
+        if ch_id is not None:
+            chan = bot.get_channel(ch_id)
+            if chan is not None and _bot_deletable(chan):
+                try:
+                    await chan.delete(reason=f"cc-discord-remote: {reason}")
+                except discord.Forbidden:
+                    print(f"  can't close channel {ch_id} ({reason}): missing Manage Channels")
+                except discord.HTTPException as e:
+                    print(f"  couldn't delete channel {ch_id} ({reason}): {e}")
+        print(f"  cleanly closed (ch={ch_id}, {reason}; claude {claude_pid}, shell {shell_pid})")
+    finally:
+        _closing_pids.discard(claude_pid)
+
+
+async def _close_marker_watcher(interval: float = 2.0):
+    """Watch close-markers/ for `/cc-close` signals and close those sessions fast.
+
+    The slash command's helper (cc_close.ps1) writes close-markers/<claude_pid> (content
+    = parent shell pid). We only act on a marker whose pid matches a TRACKED session —
+    a stale/unknown pid is just removed (never kill an arbitrary reused pid). Stale
+    markers from before this process started are cleared on boot so they can't mis-fire.
+    """
+    try:
+        CLOSE_MARKER_DIR.mkdir(parents=True, exist_ok=True)
+        for mf in CLOSE_MARKER_DIR.glob("*"):
+            try:
+                mf.unlink()
+            except OSError:
+                pass
+    except Exception as e:
+        print(f"  _close_marker_watcher boot-clear error: {e}")
+
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            if not CLOSE_MARKER_DIR.is_dir():
+                continue
+            for mf in list(CLOSE_MARKER_DIR.glob("*")):
+                try:
+                    claude_pid = int(mf.name)
+                except ValueError:
+                    try:
+                        mf.unlink()
+                    except OSError:
+                        pass
+                    continue
+                shell_pid = 0
+                try:
+                    shell_pid = int((mf.read_text(encoding="utf-8", errors="ignore").strip() or "0"))
+                except Exception:
+                    shell_pid = 0
+
+                # Find the channel attached to this claude pid (in-memory, then DB).
+                ch_id = next((c for c, p in list(attached_pids.items()) if p == claude_pid), None)
+                if ch_id is None:
+                    ch_id = next((c for c, p in sessions.all_attached() if p == claude_pid), None)
+
+                # /cc-close must ALWAYS close the session — including the Discord channel
+                # if one is bound, and the terminal regardless. The marker pid came from
+                # cc_close.ps1 walking up to THIS session's own claude.exe, so it's never an
+                # arbitrary reused pid. Close if the pid is live (kill tab) or has a channel.
+                if ch_id is not None or pid_alive(claude_pid):
+                    if not shell_pid:
+                        shell_pid = _session_shell_pid.get(claude_pid) or (_get_parent_pid_sync(claude_pid) or 0)
+                    await _close_session_cleanly(ch_id, claude_pid, shell_pid, "cc-close command")
+                else:
+                    print(f"  cc-close marker for dead/unknown pid {claude_pid} — ignoring")
+                try:
+                    mf.unlink()
+                except OSError:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"  _close_marker_watcher error (continuing): {e}")
+
+
+async def _outbox_watcher(interval: float = 3.0):
+    """Watch outbox/ for files queued by `/cc-send` and upload them to the right channel.
+
+    Filenames are `<claude_pid>__<original_name>`. Upload to the Discord channel attached
+    to that claude pid, then delete the file. A file whose pid never gets a channel
+    (truly-gone session) is dropped after a ~30s grace so the outbox can't pile up.
+    """
+    try:
+        OUTBOX_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"  _outbox_watcher mkdir error: {e}")
+    seen_no_channel: Dict[str, int] = {}  # filename → ticks waited for a channel to appear
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            if not OUTBOX_DIR.is_dir():
+                continue
+            for f in list(OUTBOX_DIR.glob("*__*")):
+                pidpart, _, orig = f.name.partition("__")
+                try:
+                    claude_pid = int(pidpart)
+                except ValueError:
+                    try:
+                        f.unlink()
+                    except OSError:
+                        pass
+                    continue
+                ch_id = next((c for c, p in list(attached_pids.items()) if p == claude_pid), None)
+                if ch_id is None:
+                    ch_id = next((c for c, p in sessions.all_attached() if p == claude_pid), None)
+                chan = bot.get_channel(ch_id) if ch_id else None
+                if chan is None:
+                    n = seen_no_channel.get(f.name, 0) + 1  # freshly-spawned session may lack a channel yet
+                    seen_no_channel[f.name] = n
+                    if n >= 10:  # ~30s
+                        print(f"  outbox: no channel for pid {claude_pid} after 30s — dropping {orig}")
+                        try:
+                            f.unlink()
+                        except OSError:
+                            pass
+                        seen_no_channel.pop(f.name, None)
+                    continue
+                seen_no_channel.pop(f.name, None)
+                try:
+                    size = f.stat().st_size
+                    if size == 0:
+                        await chan.send(f"⚠️ `{orig}` is empty — not sent.")
+                    elif size > 25 * 1024 * 1024:
+                        await chan.send(f"⚠️ `{orig}` is {size / 1024 / 1024:.1f} MB — over Discord's ~25 MB limit.")
+                    else:
+                        await chan.send(content=f"📤 `{orig}` — {size:,} bytes",
+                                        file=discord.File(str(f), filename=orig))
+                        print(f"  outbox: sent {orig} to channel {ch_id}")
+                except discord.HTTPException as e:
+                    print(f"  outbox upload failed for {orig}: {e}")
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"  _outbox_watcher error (continuing): {e}")
+
+
 async def cmd_close(channel, channel_id, user_id, name: str = ""):
     """Detach, kill the terminal window, and delete the Discord channel.
 
@@ -1297,10 +1534,18 @@ async def cmd_close(channel, channel_id, user_id, name: str = ""):
         )
         return
     pid = attached_pids.pop(target_id, None)
+    if pid:
+        _closing_pids.add(pid)  # block the reconciler from re-channeling during teardown
     mt = mirror_tasks.pop(target_id, None)
     if mt and not mt.done():
         mt.cancel()
-    sessions.set_attached_pid(target_id, None)
+    # Delete the row (not just clear the pid) so a closed session stays closed — no
+    # resume on the next reboot.
+    try:
+        sessions.conn.execute("DELETE FROM sessions WHERE channel_id = ?", (target_id,))
+        sessions.conn.commit()
+    except Exception:
+        sessions.set_attached_pid(target_id, None)
     ALLOWED_CHANNELS.discard(target_id)
 
     kill_status = ""
@@ -1321,6 +1566,9 @@ async def cmd_close(channel, channel_id, user_id, name: str = ""):
         await channel.send("⚠️ Bot needs **Manage Channels** to delete that channel.")
     except discord.HTTPException as e:
         await channel.send(f"⚠️ Couldn't delete channel: {e}")
+    finally:
+        if pid:
+            _closing_pids.discard(pid)
 
 
 async def cmd_sweep_channels(channel):
@@ -1950,12 +2198,73 @@ async def cmd_ask(channel, channel_id, user_id, prompt: str):
         active_turns.pop(channel_id, None)
 
 
+async def cmd_get_file(channel, channel_id: int, user_id: int, arg: str):
+    """Upload a file from the attached session's folder back to this Discord channel.
+
+    `!cc get <path>` — `<path>` is relative to the session's working directory, or an
+    absolute path. The inverse of dropping a file into the channel (which saves it INTO
+    the cwd). Lets you pull a text file / report / log the terminal produced back to
+    Discord (e.g. your phone).
+    """
+    arg = arg.strip().strip('"').strip("'")
+    if not arg:
+        await channel.send("Usage: `!cc get <path>` — sends a file from this session's folder to Discord (e.g. `!cc get notes.txt`).")
+        return
+
+    # Resolve the session's working directory for relative paths.
+    cwd = None
+    pid = attached_pids.get(channel_id)
+    if pid:
+        info = find_by_pid(pid)
+        cwd = info.cwd if info else None
+    if not cwd:
+        _, db_cwd = sessions.get(channel_id)
+        cwd = db_cwd
+
+    p = Path(arg)
+    if not p.is_absolute():
+        if not cwd or cwd in ("?", "") or not Path(cwd).is_dir():
+            await channel.send("⚠️ No working folder known for this channel — give an absolute path.")
+            return
+        p = Path(cwd) / arg
+
+    try:
+        if not p.exists():
+            await channel.send(f"⚠️ Not found: `{p}`")
+            return
+        if p.is_dir():
+            await channel.send(f"⚠️ `{p.name}` is a folder, not a file — give a file path (zip it first for a folder).")
+            return
+        size = p.stat().st_size
+    except OSError as e:
+        await channel.send(f"⚠️ Can't read `{arg}`: {e}")
+        return
+
+    UPLOAD_LIMIT = 25 * 1024 * 1024  # Discord's default per-file cap (non-boosted)
+    if size == 0:
+        await channel.send(f"⚠️ `{p.name}` is empty (0 bytes).")
+        return
+    if size > UPLOAD_LIMIT:
+        await channel.send(
+            f"⚠️ `{p.name}` is {size / 1024 / 1024:.1f} MB — over Discord's ~25 MB upload limit. "
+            f"Zip/split it or share another way."
+        )
+        return
+
+    sessions.audit(channel_id, user_id, "get_file", str(p))
+    try:
+        await channel.send(content=f"📄 `{p.name}` — {size:,} bytes",
+                           file=discord.File(str(p), filename=p.name))
+    except discord.HTTPException as e:
+        await channel.send(f"⚠️ Upload failed ({e}). The server's file-size limit may be lower than this file.")
+
+
 # ---------- dispatch --------------------------------------------------------
 
 COMMANDS = {
     "help", "status", "where", "new", "cancel", "live", "detach", "look",
     "close", "cd", "sessions", "resume", "attach", "spawn", "launch", "usage", "esc",
-    "keys", "pad", "cleanup", "sweep",
+    "keys", "pad", "cleanup", "sweep", "get", "file",
 }
 
 
@@ -2021,6 +2330,8 @@ async def dispatch(channel, channel_id: int, user_id: int, text: str):
             await cmd_cleanup(channel)
         elif head == "sweep":
             await cmd_sweep_channels(channel)
+        elif head in ("get", "file"):
+            await cmd_get_file(channel, channel_id, user_id, tail)
         return
 
     # First word isn't a command — treat the whole thing as a prompt.
@@ -2035,8 +2346,11 @@ async def dispatch(channel, channel_id: int, user_id: int, text: str):
 _pid_watcher_started = False
 _auto_spawn_watcher_started = False
 _orphan_sweeper_started = False
+_close_marker_watcher_started = False
+_outbox_watcher_started = False
 _boot_done = False  # on_ready re-fires on every gateway reconnect; restore must run once
 _auto_spawn_seen: set = set()  # PIDs we've already processed — populated on first poll
+_closing_pids: set = set()  # claude pids being torn down (close) — reconciler skips these
 
 
 async def _pid_watcher(interval: float = 15.0):
@@ -2063,6 +2377,11 @@ async def _pid_watcher(interval: float = 15.0):
             live_by_pid = {c.pid: c for c in list_running()}
             for ch_id, pid in tracked.items():
                 if pid_alive(pid):
+                    # Record this claude's parent PowerShell pid once. When claude later
+                    # dies we use it to tell an intentional /exit (shell stays alive thanks
+                    # to `powershell -NoExit`) from an X-out / sleep / crash (shell dies too).
+                    if ch_id not in CONTROL_CHANNELS and pid not in _session_shell_pid:
+                        _session_shell_pid[pid] = _get_parent_pid_sync(pid) or 0
                     # Keep the persisted session_id pinned to the live process's
                     # CURRENT session. Claude Code advances/forks the session_id as a
                     # conversation grows (resume, auto-compaction); if the DB holds an
@@ -2075,8 +2394,46 @@ async def _pid_watcher(interval: float = 15.0):
                         if live and live.session_id and live.session_id != "?":
                             stored_sid, stored_cwd = sessions.get(ch_id)
                             if live.session_id != stored_sid:
-                                sessions.set_identity(ch_id, live.session_id, live.cwd or stored_cwd)
+                                new_cwd = live.cwd or stored_cwd
+                                sessions.set_identity(ch_id, live.session_id, new_cwd)
                                 print(f"  sync: channel {ch_id} sid {str(stored_sid)[:8]} -> {live.session_id[:8]}")
+                                # Claude forked the session_id (auto-compaction / in-place
+                                # resume) and is now writing to a NEW JSONL. The mirror was
+                                # tailing the OLD file and would go SILENT — that's the
+                                # "Claude responds but nothing shows on Discord" bug. Re-point
+                                # the mirror at the new file (start at its end so we don't
+                                # replay compacted history) so responses keep flowing.
+                                new_jsonl = session_jsonl_path(new_cwd, live.session_id)
+                                chan = bot.get_channel(ch_id)
+                                if chan is not None and new_jsonl.is_file():
+                                    old_mt = mirror_tasks.pop(ch_id, None)
+                                    if old_mt and not old_mt.done():
+                                        old_mt.cancel()
+                                    primary = next(iter(ALLOWED_USERS), 0)
+                                    label = live.name or live.session_id[:8]
+                                    mirror_tasks[ch_id] = asyncio.create_task(
+                                        _mirror_loop(chan, ch_id, primary, new_jsonl,
+                                                     new_jsonl.stat().st_size, label)
+                                    )
+                                    print(f"  mirror re-pointed to new jsonl for channel {ch_id} (sid {live.session_id[:8]})")
+                        # Keep the Discord channel name in sync with the session's name
+                        # (set via Claude Code's /rename) — "rename the chat → rename the
+                        # channel". Only on an actual change, gated by a cooldown because
+                        # Discord caps renames at 2/10min and discord.py blocks on the limit.
+                        if live and live.name:
+                            desired = _sanitize_channel_name(live.name)
+                            chan = bot.get_channel(ch_id)
+                            if (desired and chan is not None and chan.name != desired
+                                    and _bot_deletable(chan)
+                                    and time.time() - _last_channel_rename.get(ch_id, 0) >= CHANNEL_RENAME_COOLDOWN):
+                                _last_channel_rename[ch_id] = time.time()
+                                try:
+                                    await chan.edit(name=desired, reason="cc-discord-remote: session renamed")
+                                    print(f"  renamed channel {ch_id} -> #{desired}")
+                                except discord.Forbidden:
+                                    print(f"  can't rename channel {ch_id} (missing Manage Channels)")
+                                except discord.HTTPException as e:
+                                    print(f"  rename failed for channel {ch_id}: {e}")
                     continue
 
                 # Before treating this as a terminal exit: the SAME session may
@@ -2103,7 +2460,77 @@ async def _pid_watcher(interval: float = 15.0):
                                 _mirror_loop(chan, ch_id, primary, jsonl, jsonl.stat().st_size, label)
                             )
                         print(f"  rebound channel {ch_id}: PID {pid} -> {new_pid} (session {session_id[:8]})")
+                        _auto_resume_attempts.pop(ch_id, None)
+                        _session_shell_pid.pop(pid, None)
                         continue
+
+                # NOTE: a "/exit = claude-dead + shell-alive" heuristic used to live here.
+                # It FALSE-FIRED on claude.exe crashes / auto-updates (claude dies while the
+                # `-NoExit` shell survives) and deleted LIVE sessions (lost personalclaw on
+                # 2026-06-04). Removed. Intentional close now goes only through /cc-close
+                # (close-marker, reliable) or `!cc close`. An unexpected claude death here
+                # falls through to auto-resume below — so a crash/update recovers itself.
+                # Capture the parent shell: if this was a /exit, the `-NoExit` shell is still
+                # idle in its old tab, and we close that orphan tab after the resume succeeds.
+                orphan_shell_pid = _session_shell_pid.pop(pid, 0)
+
+                # The session isn't alive anywhere, but it's still resumable on disk.
+                # That's the overnight-sleep case: closing the laptop killed every
+                # console while the (pythonw) bot kept running, so the windows are
+                # gone but the conversations survive as JSONL. Auto-RESUME into the
+                # SAME channel — same flow as reboot-restore — instead of deleting the
+                # channel. This is the auto-resume the user expects after a sleep cycle.
+                # Capped at AUTO_RESUME_MAX_ATTEMPTS so a session that genuinely can't
+                # resume doesn't respawn a PowerShell window every loop forever.
+                if (session_id and sess_cwd and sess_cwd not in ("?", "")
+                        and ch_id not in CONTROL_CHANNELS
+                        and Path(sess_cwd).is_dir()
+                        and session_jsonl_path(sess_cwd, session_id).is_file()):
+                    chan = bot.get_channel(ch_id)
+                    if chan is not None and _bot_deletable(chan):
+                        if _auto_resume_attempts.get(ch_id, 0) < AUTO_RESUME_MAX_ATTEMPTS:
+                            # Cancel the dead mirror; the resume helper starts a fresh one.
+                            mt = mirror_tasks.pop(ch_id, None)
+                            if mt and not mt.done():
+                                mt.cancel()
+                            attached_pids.pop(ch_id, None)
+                            sessions.set_attached_pid(ch_id, None)
+                            try:
+                                await chan.send("🔄 Terminal window closed — auto-resuming this session…")
+                            except Exception:
+                                pass
+                            primary = next(iter(ALLOWED_USERS), 0)
+                            ok = False
+                            try:
+                                ok = await _resume_into_existing_channel(
+                                    chan, ch_id, session_id, sess_cwd, primary
+                                )
+                            except Exception as e:
+                                print(f"  auto-resume error for channel {ch_id}: {e}")
+                            if ok:
+                                _auto_resume_attempts.pop(ch_id, None)
+                                print(f"  auto-resumed channel {ch_id} (PID {pid} died, session {session_id[:8]})")
+                                if orphan_shell_pid and pid_alive(orphan_shell_pid):
+                                    # /exit left the old -NoExit shell idle in its tab; send it
+                                    # `exit` so WT closes it → the restart is tidy (one new tab,
+                                    # no leftover). Best-effort.
+                                    try:
+                                        await _run_console_helper(orphan_shell_pid, "exit", mode="type")
+                                    except Exception:
+                                        pass
+                            else:
+                                n = _auto_resume_attempts.get(ch_id, 0) + 1
+                                _auto_resume_attempts[ch_id] = n
+                                print(f"  auto-resume attempt {n}/{AUTO_RESUME_MAX_ATTEMPTS} "
+                                      f"failed for channel {ch_id} (session {session_id[:8]})")
+                            # Whether it worked or not, don't fall through to close —
+                            # success is attached; failure retries next loop until the cap.
+                            continue
+                        else:
+                            print(f"  auto-resume gave up for channel {ch_id} after "
+                                  f"{AUTO_RESUME_MAX_ATTEMPTS} tries — closing channel")
+                            _auto_resume_attempts.pop(ch_id, None)
+                            # Fall through to the normal close path below.
 
                 # Cancel mirror task immediately — it can't drive a dead process.
                 mt = mirror_tasks.pop(ch_id, None)
@@ -2215,94 +2642,78 @@ AUTO_SPAWN_MIN_AGE_SECONDS = 30
 
 
 async def _auto_spawn_watcher(interval: float = 15.0):
-    """Poll for newly-appeared claude.exe sessions; auto-create a Discord channel.
+    """RECONCILER — ensure EVERY live terminal session ALWAYS has exactly one Discord
+    channel, and collapse race duplicates.
 
-    Seeds with all currently-running claude.exes on the FIRST iteration so the
-    bot doesn't spam channels for pre-existing sessions at startup. After that,
-    any new claude session (the user typed `claude` in a terminal) gets its own
-    channel automatically, named after `/rename` if set, else session-id prefix.
-
-    Channels are created in the guild of the first env-configured control room.
-    Skips sessions that are already attached to a channel (in attached_pids).
-    Also skips sessions younger than AUTO_SPAWN_MIN_AGE_SECONDS.
+    On every pass, for each live claude.exe session: if it has no channel (its pid isn't
+    attached anywhere, and no other live pid for the same session_id is attached) and it's
+    past the min-age, create + attach a channel. This covers brand-new sessions AND
+    sessions orphaned mid-run (e.g. a channel torn down by a manual-restart-vs-auto-resume
+    race — the symptom where a session "doesn't come up in Discord"). It's idempotent:
+    already-attached or being-closed sessions are skipped. Every ~4th pass it also sweeps
+    duplicate channels left by races. This is the "sessions always come up" guarantee.
     """
     primary_user = next(iter(ALLOWED_USERS), 0)
-    first_pass = True
+    pass_count = 0
 
     while True:
         try:
             await asyncio.sleep(interval)
+            pass_count += 1
             running = list_running()
-            current_pids = {c.pid for c in running}
-
-            if first_pass:
-                _auto_spawn_seen.update(current_pids)
-                first_pass = False
-                continue
-
-            # Drop dead PIDs from seen so PID-reuse doesn't suppress legitimate new sessions.
-            _auto_spawn_seen.intersection_update(current_pids)
-
             now_ms = time.time() * 1000
             min_age_ms = AUTO_SPAWN_MIN_AGE_SECONDS * 1000
-            already_attached = set(attached_pids.values())
-            # Session_ids that already have a channel. Skip a "new" PID whose
-            # session matches one of these — it's the same session under a new
-            # pid (in-place restart), which _pid_watcher will rebind to the
-            # existing channel. Creating a second channel here is what produced
-            # duplicate mirror loops (and duplicate Discord messages).
+            attached_pid_set = set(attached_pids.values())
+            # session_ids already bound to a LIVE channel — don't make a 2nd channel for
+            # the same session under another pid (the _pid_watcher rebind owns that case).
             attached_sids = {
                 c.session_id for c in running
-                if c.pid in already_attached and c.session_id
+                if c.pid in attached_pid_set and c.session_id
             }
-            new_sessions = [
-                c for c in running
-                if c.pid not in _auto_spawn_seen
-                and c.pid not in already_attached
-                and c.session_id not in attached_sids
-                and (c.started_at_ms is None or now_ms - c.started_at_ms >= min_age_ms)
-            ]
-            if not new_sessions:
-                continue
 
-            # Pick a guild from the first reachable control room.
             guild = None
             for cid in CONTROL_CHANNELS:
                 ch = bot.get_channel(cid)
                 if ch and getattr(ch, "guild", None):
                     guild = ch.guild
                     break
-            if guild is None:
-                # No control room found — mark new PIDs as seen so we don't retry forever.
-                _auto_spawn_seen.update(c.pid for c in new_sessions)
-                continue
 
-            for info in new_sessions:
-                _auto_spawn_seen.add(info.pid)
-                # Recheck right before we create the Discord channel: a parallel
-                # cmd_launch / cmd_resume_spawn may have claimed this PID between
-                # the snapshot above and now. Skip if so, otherwise we leak a
-                # hex-id orphan channel.
-                if info.pid in attached_pids.values():
-                    continue
-                channel_name = _sanitize_channel_name(info.name or info.session_id[:8])
+            if guild is not None:
+                for c in running:
+                    if c.pid in _closing_pids:
+                        continue  # being torn down by /cc-close / !cc close
+                    if c.pid in attached_pid_set:
+                        continue  # already has a channel
+                    if c.session_id and c.session_id in attached_sids:
+                        continue  # same session already channelled under another pid
+                    if c.started_at_ms is not None and now_ms - c.started_at_ms < min_age_ms:
+                        continue  # too young — let an in-flight resume/rebind settle first
+                    if c.pid in attached_pids.values():
+                        continue  # final recheck (a parallel attach may have claimed it)
+                    channel_name = _sanitize_channel_name(c.name or c.session_id[:8])
+                    try:
+                        new_chan = await guild.create_text_channel(
+                            name=channel_name, category=_terminal_category(guild),
+                        )
+                    except discord.Forbidden:
+                        print(f"  reconcile: missing Manage Channels in guild {guild.id}")
+                        break
+                    except discord.HTTPException as e:
+                        print(f"  reconcile: couldn't create channel for PID {c.pid}: {e}")
+                        continue
+                    ALLOWED_CHANNELS.add(new_chan.id)
+                    try:
+                        await cmd_attach(new_chan, new_chan.id, primary_user, str(c.pid))
+                        print(f"  reconcile: channel #{channel_name} for live session PID {c.pid}")
+                    except Exception as e:
+                        print(f"  reconcile: attach failed for PID {c.pid}: {e}")
+
+            # Periodically collapse duplicate channels a restart race may have left.
+            if pass_count % 4 == 0:
                 try:
-                    new_chan = await guild.create_text_channel(
-                        name=channel_name,
-                        category=_terminal_category(guild),
-                    )
-                except discord.Forbidden:
-                    print(f"  auto-spawn: missing Manage Channels in guild {guild.id}")
-                    continue
-                except discord.HTTPException as e:
-                    print(f"  auto-spawn: couldn't create channel for PID {info.pid}: {e}")
-                    continue
-                ALLOWED_CHANNELS.add(new_chan.id)
-                try:
-                    await cmd_attach(new_chan, new_chan.id, primary_user, str(info.pid))
-                    print(f"  auto-spawned channel #{channel_name} for PID {info.pid}")
+                    await _sweep_duplicate_terminal_channels()
                 except Exception as e:
-                    print(f"  auto-spawn: attach failed for PID {info.pid}: {e}")
+                    print(f"  reconcile: dedup sweep error: {e}")
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -2316,13 +2727,7 @@ async def _resume_into_existing_channel(chan, ch_id: int, session_id: str, cwd: 
     row, then attach. Returns True on success."""
     before = _list_claude_pids()
     try:
-        subprocess.Popen(
-            ["powershell.exe", "-NoExit", "-ExecutionPolicy", "Bypass", "-Command",
-             f"claude --resume {session_id}"],
-            creationflags=subprocess.CREATE_NEW_CONSOLE,
-            cwd=cwd,
-            close_fds=True,
-        )
+        _spawn_session_window(f"claude --resume {session_id}", cwd, title=session_id[:8])
     except Exception as e:
         print(f"  restore: couldn't launch resume for {session_id[:8]}: {e}")
         return False
@@ -2572,7 +2977,7 @@ async def _restore_terminals_on_boot():
 
 @bot.event
 async def on_ready():
-    global _boot_done, _pid_watcher_started, _auto_spawn_watcher_started, _orphan_sweeper_started
+    global _boot_done, _pid_watcher_started, _auto_spawn_watcher_started, _orphan_sweeper_started, _close_marker_watcher_started, _outbox_watcher_started
     print(f"Bot online as {bot.user}")
     print(f"  allowed users:    {sorted(ALLOWED_USERS) or '(none — bot will reject everyone)'}")
     print(f"  allowed channels: {sorted(ALLOWED_CHANNELS) or '(any)'}")
@@ -2692,9 +3097,18 @@ async def on_ready():
     if not _orphan_sweeper_started:
         _orphan_sweeper_started = True
         asyncio.create_task(_orphan_channel_sweeper())
+    if not _close_marker_watcher_started:
+        _close_marker_watcher_started = True
+        asyncio.create_task(_close_marker_watcher())
+    if not _outbox_watcher_started:
+        _outbox_watcher_started = True
+        asyncio.create_task(_outbox_watcher())
 
     synced_guilds = set()
-    for chan_id in ALLOWED_CHANNELS:
+    # Snapshot: the concurrent _boot_then_replay task (channel adoption/restore) can
+    # add to ALLOWED_CHANNELS while this loop awaits tree.sync — iterating the live set
+    # raised "Set changed size during iteration" and aborted the rest of on_ready.
+    for chan_id in list(ALLOWED_CHANNELS):
         chan = bot.get_channel(chan_id)
         if chan and getattr(chan, "guild", None) and chan.guild.id not in synced_guilds:
             try:

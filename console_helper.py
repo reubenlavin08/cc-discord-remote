@@ -56,6 +56,18 @@ NAMED_KEYS = {
     "space": (VK_SPACE, " "),
 }
 
+# Arrow keys → VT escape sequences. Claude Code v2.1.158+ (the Ink/React TUI) reads
+# arrow navigation from VT escape sequences on stdin, NOT from synthesized VK_DOWN/UP
+# key events (those are silently ignored). We inject the sequence as consecutive
+# char key-events flushed in ONE WriteConsoleInput batch so the TUI's VT parser reads
+# it as a single arrow press — if the chars arrive split, a lone ESC reads as cancel.
+VT_ARROWS = {
+    "up": "\x1b[A",
+    "down": "\x1b[B",
+    "right": "\x1b[C",
+    "left": "\x1b[D",
+}
+
 
 class COORD(ctypes.Structure):
     _fields_ = [("X", c_short), ("Y", c_short)]
@@ -225,9 +237,37 @@ def _write_text(h_in: int, text: str):
     ])
 
 
+def _vt_char_event(ch: str, key_down: bool) -> INPUT_RECORD:
+    """A key event carrying a raw char with no VK/scan code — used for VT escape bytes.
+    Matches what a real terminal feeds the Ink TUI for an arrow press."""
+    rec = INPUT_RECORD()
+    rec.EventType = KEY_EVENT
+    rec.Event.KeyEvent.bKeyDown = 1 if key_down else 0
+    rec.Event.KeyEvent.wRepeatCount = 1
+    rec.Event.KeyEvent.wVirtualKeyCode = 0
+    rec.Event.KeyEvent.wVirtualScanCode = 0
+    rec.Event.KeyEvent.uChar = ch
+    rec.Event.KeyEvent.dwControlKeyState = 0
+    return rec
+
+
+def _send_vt_arrow(h_in: int, seq: str) -> None:
+    """Inject a VT escape arrow sequence as one atomic batch (all chars, no gaps)."""
+    events: list = []
+    for ch in seq:
+        events.append(_vt_char_event(ch, True))
+        events.append(_vt_char_event(ch, False))
+    _flush_events(h_in, events)
+
+
 def _send_single_key(h_in: int, token: str) -> None:
     """Send one key event for the named token or a single printable char (no trailing Enter)."""
     key = token.lower()
+    if key in VT_ARROWS:
+        # Arrows MUST go out as VT escape sequences (see VT_ARROWS note) — VK events
+        # are ignored by Claude Code v2.1.158+.
+        _send_vt_arrow(h_in, VT_ARROWS[key])
+        return
     if key in NAMED_KEYS:
         vk, ch = NAMED_KEYS[key]
     elif len(token) == 1:
