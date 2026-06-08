@@ -625,6 +625,33 @@ def _screen_looks_navigable(screen: str) -> bool:
     )
 
 
+def _screen_pending_question(screen: str) -> bool:
+    """True if an AskUserQuestion picker is OPEN on screen, by its footer
+    'Enter to select · ↑/↓ to navigate · Esc to cancel'. We detect questions by screen
+    because Claude Code does NOT write the question to the JSONL until it's answered —
+    confirmed 2026-06-08: the session log didn't grow one byte while a question sat on
+    screen for 80s — so the JSONL-tailing mirror can't surface it in time."""
+    if not screen:
+        return False
+    tail = "\n".join(screen.splitlines()[-22:]).lower()
+    return ("to navigate" in tail) and ("to cancel" in tail) and ("to select" in tail)
+
+
+def _extract_picker_text(screen: str) -> str:
+    """Pull the visible question + options out of the on-screen picker (the lines ending
+    at the 'to navigate' footer), dropping pure box-border lines."""
+    lines = screen.splitlines()
+    end = len(lines)
+    for i in range(len(lines) - 1, -1, -1):
+        if "to navigate" in lines[i].lower():
+            end = i + 1
+            break
+    chunk = lines[max(0, end - 16):end]
+    keep = [ln.rstrip() for ln in chunk
+            if ln.strip() and (set(ln.strip()) - set("─│╭╮╰╯—-_= "))]
+    return "\n".join(keep)[-1500:]
+
+
 class DenyInstructModal(discord.ui.Modal, title="Tell Claude what to do differently"):
     instruction = discord.ui.TextInput(
         label="Instruction",
@@ -1505,6 +1532,65 @@ async def _outbox_watcher(interval: float = 3.0):
             print(f"  _outbox_watcher error (continuing): {e}")
 
 
+async def _picker_watcher(interval: float = 1.5):
+    """Surface a pending AskUserQuestion to Discord IN TIME by reading the live SCREEN.
+
+    Claude Code buffers the question out of the JSONL until it's answered, so the
+    JSONL-tailing mirror always shows it too late. This watcher scrapes every attached
+    session's screen each tick (concurrently — _run_console_helper is temp-file isolated)
+    and, when an AskUserQuestion picker is open, posts the question + the keypad so the
+    user can answer from Discord before they answer in the terminal. Deduped per channel
+    by the visible question text; reset when the picker leaves the screen.
+    """
+    async def _scrape(ch_id, pid):
+        if not pid_alive(pid):
+            return ch_id, None
+        try:
+            return ch_id, await _run_console_helper(pid, "", mode="look")
+        except Exception:
+            return ch_id, None
+
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            items = list(attached_pids.items())
+            if not items:
+                continue
+            for ch_id, screen in await asyncio.gather(*[_scrape(c, p) for c, p in items]):
+                if not screen:
+                    continue
+                if not _screen_pending_question(screen):
+                    _picker_rendered.pop(ch_id, None)  # picker gone → allow the next question
+                    continue
+                qtext = _extract_picker_text(screen)
+                # Dedup on a NORMALIZED key (letters+digits only) so the blinking cursor /
+                # moving option highlight doesn't change the text and make it re-post every
+                # 1.5s tick. A genuinely new question (different options) still re-posts.
+                key = re.sub(r"[^a-z0-9]+", "", qtext.lower())
+                if not key or _picker_rendered.get(ch_id) == key:
+                    continue
+                _picker_rendered[ch_id] = key
+                chan = bot.get_channel(ch_id)
+                if chan is None:
+                    continue
+                primary = next(iter(ALLOWED_USERS), None)
+                ping = f"<@{primary}> " if primary else ""
+                try:
+                    await send_chunked(
+                        chan,
+                        f"{ping}❓ **Claude is asking you something** — answer with the keypad "
+                        f"below (↑/↓ to move · Enter to select):\n```\n{qtext}\n```",
+                    )
+                    await chan.send("⬇️ keypad:", view=RemoteKeypadView(ch_id))
+                    print(f"  [picker] surfaced screen-detected question to channel {ch_id}")
+                except discord.HTTPException as e:
+                    print(f"  [picker] surface failed for {ch_id}: {e}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"  _picker_watcher error (continuing): {e}")
+
+
 async def cmd_close(channel, channel_id, user_id, name: str = ""):
     """Detach, kill the terminal window, and delete the Discord channel.
 
@@ -1783,6 +1869,7 @@ async def _render_piece(
     data: dict,
     pending_tools: Dict[str, tuple],
     pickers_rendered: set,
+    resolved_tool_ids: set = frozenset(),
 ):
     """Render one parsed JSONL piece into Discord, pairing tools with their results.
 
@@ -1805,6 +1892,12 @@ async def _render_piece(
         tid = data.get("id")
         name = data["name"]
         if name == "AskUserQuestion":
+            # Claude Code buffers the question out of the JSONL until it's answered, so by
+            # the time we read it here it's already RESOLVED — and the live picker was
+            # surfaced from the screen by _picker_watcher. Don't re-post a stale picker.
+            if tid and tid in resolved_tool_ids:
+                pickers_rendered.add(tid)
+                return
             # Eager render with @mention so the user notices the blocking prompt,
             # AND attach clickable option buttons so they can answer with a tap
             # instead of typing the number.
@@ -1821,21 +1914,32 @@ async def _render_piece(
                 for opt in (questions[0].get("options") or []):
                     if isinstance(opt, dict) and opt.get("label"):
                         option_labels.append(opt["label"])
-            pid_here = attached_pids.get(channel.id)
-            # Buttons only for single-select, single-question prompts driven by a
-            # live terminal; otherwise fall back to text + type-the-number.
-            view = None
-            if pid_here and option_labels and not multi and len(questions) == 1:
+            # Buttons for any single-select, single-question prompt. The pid is resolved
+            # at CLICK time (the button handler already does attached_pids.get + errors if
+            # gone), so DON'T gate the render on pid_here — that gate was suppressing the
+            # keypad whenever the channel's attachment had momentarily drifted (the exact
+            # "no keypad pops up" symptom). Multi-select / multi-question still fall back to
+            # text + type-the-number.
+            # ALWAYS attach a keypad. Single-select single-question → one tappable button
+            # per option (the convenient case). Multi-select / multi-question → option
+            # buttons don't map cleanly to the toggle/sequential TUI, so fall back to the
+            # generic keypad (↑/↓ move, Enter confirm, Space toggles a multi-select) so the
+            # user can still answer from Discord instead of getting no keypad at all.
+            if option_labels and not multi and len(questions) == 1:
                 view = AskUserQuestionView(channel.id, option_labels)
-            hint = "tap an option below" if view else "reply with the option number"
+                hint = "tap an option below"
+                choose_label = "⬇️ choose:"
+            else:
+                view = RemoteKeypadView(channel.id)
+                hint = "use the keypad — ↑/↓ to move, Enter to confirm, Space to toggle (multi-select), then Enter"
+                choose_label = "⬇️ keypad (answer each question in order):"
             try:
                 # send_chunked can split long text; send the prompt body first,
                 # then a final short line carrying the buttons so the view always
                 # attaches to a delivered message.
                 await send_chunked(channel, f"{ping}❓ **Claude needs your input** — {hint}:{preview}")
-                if view is not None:
-                    await channel.send("⬇️ choose:", view=view)
-                print(f"  [mirror] AskUserQuestion render succeeded for tid={tid} (buttons={view is not None})")
+                await channel.send(choose_label, view=view)
+                print(f"  [mirror] AskUserQuestion render succeeded for tid={tid} (view={type(view).__name__})")
             except Exception as e:
                 print(f"  [mirror] AskUserQuestion render FAILED for tid={tid}: {type(e).__name__}: {e}")
                 raise
@@ -1965,7 +2069,7 @@ async def _mirror_loop(channel, channel_id: int, user_id: int, jsonl_path: Path,
 
                 pieces = extract_user_facing(new_objs)
                 for kind, data in pieces:
-                    await _render_piece(channel, kind, data, pending_tools, pickers_rendered)
+                    await _render_piece(channel, kind, data, pending_tools, pickers_rendered, resolved_tool_ids)
                     if kind == "text":
                         last_assistant_at = time.time()
                         pinged_for_turn = False
@@ -2099,17 +2203,43 @@ async def cmd_terminal_send(channel, channel_id, user_id, text: str):
         await _wait_while_compacting(channel, pid)
 
     async with channel.typing():
-        # Dismiss any TUI menu (e.g. /usage output, picker, dialog) that would
-        # otherwise swallow the injected keystrokes. Esc at the normal prompt
-        # is a no-op, so this is safe to send before plain-text typing —
-        # EXCEPT when an interactive picker (AskUserQuestion) is waiting on
-        # input, because Esc cancels the picker. In that case the user is
-        # typing the option number/text, and we want it to reach the picker.
+        busy = False
+        # We normally Esc before typing to dismiss any stray TUI menu/dialog that would
+        # swallow the keystrokes. BUT Esc CANCELS an active turn — so if a message arrives
+        # while Claude is mid-tool-use, the Esc interrupts it (the bug). Scrape once: if
+        # Claude is working (its footer shows "esc to interrupt"), DON'T Esc — just type.
+        # Claude Code queues a message typed mid-turn and runs it after, instead of
+        # interrupting. Also never Esc an AskUserQuestion picker (Esc cancels it).
         if mode == "type":
+            pre = await _run_console_helper(pid, "", mode="look")
+            # Working = the spinner line, e.g. "✶ Choreographing… (2m 47s · ↓ 11.8k
+            # tokens)". Match that elapsed-time+tokens pattern (the "esc to interrupt"
+            # hint truncates at narrow widths, so don't rely on it alone).
+            busy = bool(re.search(r"\(\d[\dms\s]*s\b[^)]*tokens", pre)) or "esc to interrupt" in pre.lower()
             picker = _pending_picker_tool(session_jsonl_path(info.cwd, info.session_id))
-            if picker != "AskUserQuestion":
+            if picker != "AskUserQuestion" and not busy:
                 await _run_console_helper(pid, "", mode="esc")
         result = await _run_console_helper(pid, text, mode=mode)
+
+        # Verify the submit. On the newer TUI the trailing Enter is sometimes dropped,
+        # leaving the typed text sitting in the input box unsent ("my message didn't
+        # send"). If the tail of what we typed is still in the bottom (input) area, the
+        # Enter was lost — press it again. A spurious extra Enter at an empty prompt is a
+        # harmless no-op. SKIP when Claude was busy: the message is queued (input box
+        # clears), so the tail check doesn't apply and a re-press could disturb the queue.
+        if mode == "type" and not busy:
+            tail = " ".join(text.split())[-22:]
+            for _ in range(2):
+                if not tail:
+                    break
+                await asyncio.sleep(0.5)
+                screen = await _run_console_helper(pid, "", mode="look")
+                bottom = " ".join("\n".join(screen.splitlines()[-4:]).split())
+                if tail in bottom:  # still in the input box → not submitted
+                    print(f"  [send] Enter dropped for channel {channel_id}; re-pressing")
+                    await _run_console_helper(pid, "", mode="enter")
+                else:
+                    break
 
     if "AttachConsole" in result and "failed" in result:
         await channel.send(f"⚠️ {result.strip()}")
@@ -2348,6 +2478,8 @@ _auto_spawn_watcher_started = False
 _orphan_sweeper_started = False
 _close_marker_watcher_started = False
 _outbox_watcher_started = False
+_picker_watcher_started = False
+_picker_rendered: Dict[int, str] = {}  # channel_id -> question text already surfaced (dedup)
 _boot_done = False  # on_ready re-fires on every gateway reconnect; restore must run once
 _auto_spawn_seen: set = set()  # PIDs we've already processed — populated on first poll
 _closing_pids: set = set()  # claude pids being torn down (close) — reconciler skips these
@@ -2977,7 +3109,7 @@ async def _restore_terminals_on_boot():
 
 @bot.event
 async def on_ready():
-    global _boot_done, _pid_watcher_started, _auto_spawn_watcher_started, _orphan_sweeper_started, _close_marker_watcher_started, _outbox_watcher_started
+    global _boot_done, _pid_watcher_started, _auto_spawn_watcher_started, _orphan_sweeper_started, _close_marker_watcher_started, _outbox_watcher_started, _picker_watcher_started
     print(f"Bot online as {bot.user}")
     print(f"  allowed users:    {sorted(ALLOWED_USERS) or '(none — bot will reject everyone)'}")
     print(f"  allowed channels: {sorted(ALLOWED_CHANNELS) or '(any)'}")
@@ -3103,6 +3235,9 @@ async def on_ready():
     if not _outbox_watcher_started:
         _outbox_watcher_started = True
         asyncio.create_task(_outbox_watcher())
+    if not _picker_watcher_started:
+        _picker_watcher_started = True
+        asyncio.create_task(_picker_watcher())
 
     synced_guilds = set()
     # Snapshot: the concurrent _boot_then_replay task (channel adoption/restore) can

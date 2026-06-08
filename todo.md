@@ -92,6 +92,12 @@ Reuben wanted to close a tab from inside the Claude terminal without /exit's 15s
 - Verified: watcher loop runs, ignores+cleans an unknown-pid marker. Real-session kill path not live-tested (would close a session) but shares the verified `_close_session_cleanly`. `close-markers/` gitignored.
 - Note: existing running sessions may need a fresh start to see the new slash command; `!cc close` (Discord) and `/exit` remain as alternates.
 
+## ✅ DONE — AskUserQuestion keypad + Enter-submit reliability (2026-06-06)
+Reuben: questions don't surface a keypad (and "no reply"), and messages often don't send (Enter not pressed).
+- **Keypad fix:** `_render_piece` gated the AskUserQuestion buttons on `pid_here = attached_pids.get(channel.id)` being set AT RENDER time — so whenever the channel's attachment had momentarily drifted, `buttons=False` (confirmed in bot.log: 3 renders all `buttons=False`). But the button CLICK handler already resolves the pid at click time + errors gracefully. Removed the render-time gate → keypad now shows for any single-select single-question prompt. (AskUserQuestion JSONL format verified UNCHANGED — questions[].options[].label.)
+- **Enter-submit fix:** `cmd_terminal_send` (mode=type) had NO submit verification — a dropped Enter left the text in the input box unsent. Added: after typing, scrape; if the tail of the message is still in the bottom (input) area, re-press Enter (≤2 retries). Spurious extra Enter at an idle prompt is a harmless no-op. Logs `[send] Enter dropped ... re-pressing`.
+- Deployed (no-/T restart). Live-tested the keypad via an AskUserQuestion to #remote-control.
+
 ## ✅ DONE — channel reconciler + close hardening (2026-06-05)
 Reuben: "all terminal sessions should ALWAYS auto come up as channels", "harden the bot" (the manual-restart-vs-auto-resume race that orphaned unity — live session, no channel until a restart), and "/cc-close must also close the Discord channel".
 - **Reconciler:** reworked `_auto_spawn_watcher` from "channel only NEW pids" → "ensure EVERY live session always has exactly one channel" (create+attach any live session lacking one, idempotent; min-age gate avoids racing an in-flight resume; skips `_closing_pids`). Verified: 2 passes, 0 spurious channels, no dup rows. Every ~4th pass also runs `_sweep_duplicate_terminal_channels` to collapse race dups.
