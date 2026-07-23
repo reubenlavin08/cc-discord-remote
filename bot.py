@@ -1386,9 +1386,28 @@ async def _close_session_cleanly(ch_id, claude_pid: int, shell_pid: int, reason:
         if shell_pid and pid_alive(shell_pid):
             await asyncio.sleep(0.4)  # let the shell return to its prompt
             try:
-                await _run_console_helper(shell_pid, "exit", mode="type")  # graceful → WT closes tab
+                # claude.exe was hard-killed above, so it never ran its terminal
+                # restore — the shell is left with mouse-reporting + bracketed-paste
+                # modes still ON. On the next mouse move that floods the prompt with
+                # "[<..M" SGR codes, which ALSO mangles a plain `exit` (it lands in the
+                # middle of the garbage and never runs → the tab hangs open forever,
+                # exactly the /cc-close symptom). So first WRITE the disable sequences
+                # to the console to stop the flood, then exit 0 so WT closes the tab
+                # cleanly. [char]27 (not `e) because these tabs run Windows PowerShell 5.1.
+                reset = ("[Console]::Write([char]27+'[?1000l'+[char]27+'[?1002l'+"
+                         "[char]27+'[?1003l'+[char]27+'[?1006l'+[char]27+'[?2004l'); exit")
+                await _run_console_helper(shell_pid, reset, mode="type")  # graceful → WT closes tab
             except Exception:
                 pass
+            # Guarantee the tab actually closes: if the graceful exit hasn't taken
+            # within ~1.6s (e.g. a mouse-flood mangled the typed command), force-kill
+            # the shell so /cc-close never leaves a stuck, flooded tab behind.
+            for _ in range(8):
+                if not pid_alive(shell_pid):
+                    break
+                await asyncio.sleep(0.2)
+            if pid_alive(shell_pid):
+                _kill_tree(shell_pid)
 
         if ch_id is not None:
             chan = bot.get_channel(ch_id)
