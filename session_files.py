@@ -7,6 +7,7 @@ the interactive `claude` CLI, so sessions are interchangeable.
 """
 
 import json
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -117,6 +118,52 @@ def find_by_prefix(prefix: str) -> Optional[SessionSummary]:
     for s in list_recent_sessions(limit=200):
         if s.session_id.lower().startswith(prefix_lc):
             return s
+    return None
+
+
+def summarize_session(session_id: str, cwd: Optional[str] = None) -> Optional[SessionSummary]:
+    """Locate a session's JSONL by id (fast path if the cwd is known, else scan all
+    project dirs) and summarize it. Used to name Discord channels after the session."""
+    if not session_id:
+        return None
+    if cwd and cwd not in ("?", ""):
+        enc = "".join(ch if ch.isalnum() else "-" for ch in cwd)
+        p = CLAUDE_PROJECTS / enc / f"{session_id}.jsonl"
+        if p.is_file():
+            try:
+                return _summarize(p, p.stat().st_mtime)
+            except OSError:
+                pass
+    for p in CLAUDE_PROJECTS.glob(f"*/{session_id}.jsonl"):
+        try:
+            return _summarize(p, p.stat().st_mtime)
+        except OSError:
+            continue
+    return None
+
+
+def _short_phrase(text: str, max_words: int = 5) -> str:
+    """First few meaningful words of a prompt, with tag/markup noise stripped —
+    turns a first prompt into a compact channel-name seed."""
+    t = re.sub(r"<[^>]+>", " ", text or "")       # drop <system-reminder> etc.
+    t = re.sub(r"[`*_>#\[\]()]", " ", t)            # drop markdown punctuation
+    t = re.sub(r"\s+", " ", t).strip()
+    return " ".join(t.split()[:max_words])
+
+
+def session_title(session_id: str, cwd: Optional[str] = None) -> Optional[str]:
+    """Best human title for a session: the /rename customTitle, else a short phrase
+    from its first real prompt (Claude's on-disk auto-summary is unreliable, so the
+    first prompt is the dependable auto-name). None if the session has neither."""
+    s = summarize_session(session_id, cwd)
+    if s is None:
+        return None
+    if s.custom_name:
+        return s.custom_name
+    if s.first_prompt:
+        phrase = _short_phrase(s.first_prompt)
+        if phrase:
+            return phrase
     return None
 
 

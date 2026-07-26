@@ -29,7 +29,7 @@ import tempfile
 from approvals import request_approval
 from live_processes import find_by_pid, list_running, pid_alive, session_jsonl_path
 from runner import READ_ONLY_TOOLS, run_turn
-from session_files import find_by_prefix, find_live_session, format_age, list_recent_sessions
+from session_files import find_by_prefix, find_live_session, format_age, list_recent_sessions, session_title
 from session_tail import extract_user_facing, wait_for_completion
 from sessions import SessionStore
 
@@ -488,8 +488,7 @@ async def cmd_resume_spawn(channel, user_id: int, s):
         )
         return
 
-    raw_name = s.custom_name or s.first_prompt or short
-    sanitized = _sanitize_channel_name(raw_name)
+    sanitized = _channel_name_for(s.cwd, s.session_id, s.custom_name or s.first_prompt)
     try:
         new_chan = await channel.guild.create_text_channel(
             name=sanitized,
@@ -1077,8 +1076,67 @@ async def cmd_detach(channel, channel_id):
 
 def _sanitize_channel_name(raw: str) -> str:
     out = "".join(c if c.isalnum() or c in "-_" else "-" for c in (raw or "").lower())
+    # collapse runs of '-' so a phrase doesn't become "a---b"
+    while "--" in out:
+        out = out.replace("--", "-")
     out = out.strip("-")[:90]
     return out or "claude-attached"
+
+
+def _channel_name_for(cwd: Optional[str], session_id: Optional[str],
+                      live_name: Optional[str] = None) -> str:
+    """Human channel name — NEVER a raw session id / hex. Priority:
+    1. an explicit/registry name (a /rename), 2. the session's Claude title
+    (customTitle or first-prompt phrase), 3. the working-folder name, 4. 'claude'."""
+    name = (live_name or "").strip()
+    if not name and session_id:
+        try:
+            name = session_title(session_id, cwd) or ""
+        except Exception:
+            name = ""
+    if not name and cwd and cwd not in ("?", ""):
+        try:
+            name = Path(cwd).name
+        except Exception:
+            name = ""
+    return _sanitize_channel_name(name or "claude")
+
+
+def _is_placeholder_name(name: Optional[str], session_id: Optional[str] = None) -> bool:
+    """True if a channel name is an auto-generated placeholder (raw session-id hex,
+    `user-xx`, or `claude`/`claude-attached`) that should be healed to a real title."""
+    if not name:
+        return True
+    n = name.lower()
+    if n in ("claude", "claude-attached"):
+        return True
+    if session_id and n == session_id[:8].lower():
+        return True
+    if re.fullmatch(r"[0-9a-f]{6,12}", n):
+        return True
+    if re.fullmatch(r"user-[0-9a-z]{1,8}", n):
+        return True
+    return False
+
+
+def _existing_channel_for_session(session_id: Optional[str]):
+    """An existing bot-managed Discord channel already bound to this session_id, so the
+    reconciler can rebind instead of creating a duplicate. None if there is none."""
+    if not session_id:
+        return None
+    try:
+        rows = sessions.conn.execute(
+            "SELECT channel_id FROM sessions WHERE session_id = ?", (session_id,)
+        ).fetchall()
+    except Exception:
+        return None
+    for (ch_id,) in rows:
+        if ch_id in CONTROL_CHANNELS:
+            continue
+        chan = bot.get_channel(ch_id)
+        if chan is not None and _bot_deletable(chan):
+            return chan
+    return None
 
 
 async def cmd_spawn(channel, user_id: int, query: str):
@@ -1108,7 +1166,7 @@ async def cmd_spawn(channel, user_id: int, query: str):
         await channel.send(f"No running Claude matches `{query}`.")
         return
 
-    channel_name = _sanitize_channel_name(match.name or match.session_id[:8])
+    channel_name = _channel_name_for(match.cwd, match.session_id, match.name)
     try:
         new_chan = await channel.guild.create_text_channel(
             name=channel_name,
@@ -2568,13 +2626,17 @@ async def _pid_watcher(interval: float = 15.0):
                                     )
                                     print(f"  mirror re-pointed to new jsonl for channel {ch_id} (sid {live.session_id[:8]})")
                         # Keep the Discord channel name in sync with the session's name
-                        # (set via Claude Code's /rename) — "rename the chat → rename the
-                        # channel". Only on an actual change, gated by a cooldown because
-                        # Discord caps renames at 2/10min and discord.py blocks on the limit.
-                        if live and live.name:
-                            desired = _sanitize_channel_name(live.name)
+                        # ("rename the chat → rename the channel") AND heal existing
+                        # placeholder/hex names (e.g. #user-a5) to a real title. Compute
+                        # the desired name the same way new channels are named; rename
+                        # when the session was /renamed OR the current name is a
+                        # placeholder. Gated by a cooldown (Discord caps renames 2/10min).
+                        if live:
+                            desired = _channel_name_for(live.cwd, live.session_id, live.name)
                             chan = bot.get_channel(ch_id)
-                            if (desired and chan is not None and chan.name != desired
+                            heal = chan is not None and _is_placeholder_name(chan.name, live.session_id)
+                            if ((live.name or heal) and desired and chan is not None
+                                    and chan.name != desired
                                     and _bot_deletable(chan)
                                     and time.time() - _last_channel_rename.get(ch_id, 0) >= CHANNEL_RENAME_COOLDOWN):
                                 _last_channel_rename[ch_id] = time.time()
@@ -2841,7 +2903,23 @@ async def _auto_spawn_watcher(interval: float = 15.0):
                         continue  # too young — let an in-flight resume/rebind settle first
                     if c.pid in attached_pids.values():
                         continue  # final recheck (a parallel attach may have claimed it)
-                    channel_name = _sanitize_channel_name(c.name or c.session_id[:8])
+                    # Rule 2 — reuse, don't duplicate. If this session_id already owns a
+                    # channel, rebind it to the live pid instead of making a second one
+                    # (the in-place-restart / PID-fork race that produced 3x #piano). If
+                    # that channel is already driven by ANOTHER live pid, this pid is a
+                    # duplicate process for the same conversation — leave it channel-less.
+                    existing = _existing_channel_for_session(c.session_id)
+                    if existing is not None:
+                        cur = attached_pids.get(existing.id)
+                        if cur and cur != c.pid and pid_alive(cur):
+                            continue
+                        try:
+                            await cmd_attach(existing, existing.id, primary_user, str(c.pid))
+                            print(f"  reconcile: rebound #{existing.name} -> live PID {c.pid} (session {c.session_id[:8]})")
+                        except Exception as e:
+                            print(f"  reconcile: rebind failed for PID {c.pid}: {e}")
+                        continue
+                    channel_name = _channel_name_for(c.cwd, c.session_id, c.name)
                     try:
                         new_chan = await guild.create_text_channel(
                             name=channel_name, category=_terminal_category(guild),
@@ -2954,7 +3032,7 @@ async def _adopt_orphan_live_sessions():
             continue
         adopted_sids.add(c.session_id)
         _auto_spawn_seen.add(c.pid)  # keep the auto-spawn watcher from double-creating
-        channel_name = _sanitize_channel_name(c.name or c.session_id[:8])
+        channel_name = _channel_name_for(c.cwd, c.session_id, c.name)
         try:
             new_chan = await guild.create_text_channel(
                 name=channel_name, category=_terminal_category(guild)
@@ -3035,21 +3113,41 @@ async def _dedup_session_channels():
     for sid, ch_ids in by_sid.items():
         if len(ch_ids) < 2:
             continue
-        keep = {c for c in ch_ids if c in attached_pids}
-        if not keep:
-            continue  # none live — don't guess which to keep
+        # Keep EXACTLY ONE channel per session — even when several are ATTACHED (the
+        # in-place-restart bug that bound one session to multiple live pids, so every
+        # message posted 2-3x across duplicate #piano channels). Prefer the channel on
+        # the session's CURRENT live process, then any live-attached channel, then one
+        # whose Discord channel still exists; stable tiebreak on channel_id.
+        live = find_live_session(sid)
+        live_pid = live.get("pid") if live else None
+
+        def _keep_score(ch_id, _lp=live_pid):
+            ap = attached_pids.get(ch_id)
+            return (
+                1 if (_lp and ap == _lp) else 0,
+                1 if (ap and pid_alive(ap)) else 0,
+                1 if bot.get_channel(ch_id) is not None else 0,
+                ch_id,
+            )
+
+        keep = max(ch_ids, key=_keep_score)
         for ch_id in ch_ids:
-            if ch_id in keep or ch_id in CONTROL_CHANNELS:
+            if ch_id == keep or ch_id in CONTROL_CHANNELS:
                 continue
             chan = bot.get_channel(ch_id)
+            # Stop this duplicate from mirroring (double-posting) before removing it.
+            mt = mirror_tasks.pop(ch_id, None)
+            if mt and not mt.done():
+                mt.cancel()
+            attached_pids.pop(ch_id, None)
             if chan is not None and not _bot_deletable(chan):
                 sessions.conn.execute("DELETE FROM sessions WHERE channel_id = ?", (ch_id,))
                 changed = True
                 continue  # human channel that shares a session — untrack, never delete
             if chan is not None:
                 try:
-                    await chan.delete(reason="cc-discord-remote: duplicate channel for live session")
-                    print(f"  dedup: deleted duplicate channel {ch_id} for live session {sid[:8]}")
+                    await chan.delete(reason="cc-discord-remote: duplicate channel for session")
+                    print(f"  dedup: deleted duplicate channel {ch_id} for session {sid[:8]} (kept {keep})")
                 except Exception as e:
                     print(f"  dedup: couldn't delete {ch_id}: {e}")
             sessions.conn.execute("DELETE FROM sessions WHERE channel_id = ?", (ch_id,))
