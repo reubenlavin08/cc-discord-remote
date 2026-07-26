@@ -1089,6 +1089,8 @@ def _channel_name_for(cwd: Optional[str], session_id: Optional[str],
     1. an explicit/registry name (a /rename), 2. the session's Claude title
     (customTitle or first-prompt phrase), 3. the working-folder name, 4. 'claude'."""
     name = (live_name or "").strip()
+    if name and _is_placeholder_name(name, session_id):
+        name = ""  # a placeholder registry name (user-xx / hex) must not beat a real title
     if not name and session_id:
         try:
             name = session_title(session_id, cwd) or ""
@@ -2634,8 +2636,13 @@ async def _pid_watcher(interval: float = 15.0):
                         if live:
                             desired = _channel_name_for(live.cwd, live.session_id, live.name)
                             chan = bot.get_channel(ch_id)
+                            # A REAL /rename (not a placeholder) syncs the channel name;
+                            # a placeholder CURRENT channel name (#user-a5, hex) gets healed.
+                            # A placeholder registry name alone won't override a name the
+                            # user set manually in Discord.
+                            real_rename = bool(live.name) and not _is_placeholder_name(live.name, live.session_id)
                             heal = chan is not None and _is_placeholder_name(chan.name, live.session_id)
-                            if ((live.name or heal) and desired and chan is not None
+                            if ((real_rename or heal) and desired and chan is not None
                                     and chan.name != desired
                                     and _bot_deletable(chan)
                                     and time.time() - _last_channel_rename.get(ch_id, 0) >= CHANNEL_RENAME_COOLDOWN):
