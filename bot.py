@@ -1084,12 +1084,17 @@ def _sanitize_channel_name(raw: str) -> str:
 
 
 def _channel_name_for(cwd: Optional[str], session_id: Optional[str],
-                      live_name: Optional[str] = None) -> str:
-    """Human channel name — NEVER a raw session id / hex. Priority:
-    1. an explicit/registry name (a /rename), 2. the session's Claude title
-    (customTitle or first-prompt phrase), 3. the working-folder name, 4. 'claude'."""
+                      live_name: Optional[str] = None,
+                      name_source: Optional[str] = None) -> str:
+    """Human channel name — NEVER a raw session id / hex / per-launch placeholder.
+    Priority: 1. an explicit/registry name (a real /rename), 2. the session's Claude
+    title (customTitle or first-prompt phrase), 3. the working-folder name, 4. 'claude'.
+
+    Names must be STABLE across relaunches of the same project: an unstable name
+    (one carrying a per-launch hex suffix) makes every restart create a brand-new
+    channel instead of reusing the existing one."""
     name = (live_name or "").strip()
-    if name and _is_placeholder_name(name, session_id):
+    if name and _is_placeholder_name(name, session_id, cwd, name_source):
         name = ""  # a placeholder registry name (user-xx / hex) must not beat a real title
     if not name and session_id:
         try:
@@ -1104,18 +1109,52 @@ def _channel_name_for(cwd: Optional[str], session_id: Optional[str],
     return _sanitize_channel_name(name or "claude")
 
 
-def _is_placeholder_name(name: Optional[str], session_id: Optional[str] = None) -> bool:
-    """True if a channel name is an auto-generated placeholder (raw session-id hex,
-    `user-xx`, or `claude`/`claude-attached`) that should be healed to a real title."""
+def _derived_name_base(name: Optional[str]) -> Optional[str]:
+    """Strip Claude Code's per-launch `-<2 hex>` suffix from a derived session name.
+    "claude-monitor-35" -> "claude-monitor". None if it doesn't look derived."""
+    if not name:
+        return None
+    m = re.fullmatch(r"(.+)-[0-9a-f]{2}", name.strip().lower())
+    return m.group(1) if m else None
+
+
+def _is_placeholder_name(name: Optional[str], session_id: Optional[str] = None,
+                         cwd: Optional[str] = None,
+                         name_source: Optional[str] = None) -> bool:
+    """True if a name is an auto-generated placeholder (raw session-id hex, a
+    Claude-derived `<folder>-<2hex>`, or `claude`/`claude-attached`) that must be
+    healed to a real title rather than used as a channel name.
+
+    Claude Code marks auto-generated names with nameSource="derived" and shapes them
+    as `<cwd folder>-<2 random hex>` (e.g. "user-b2", "claude-monitor-35"). Those
+    change on EVERY launch, so treating one as a real name makes each relaunch spawn
+    a brand-new uniquely-named channel — the duplicate-channel bug. nameSource is
+    authoritative when we have it; the shape checks cover names read back off a
+    Discord channel, where nameSource isn't available."""
     if not name:
         return True
-    n = name.lower()
+    n = name.strip().lower()
     if n in ("claude", "claude-attached"):
+        return True
+    # Authoritative: Claude Code says it generated this name itself.
+    if (name_source or "").lower() == "derived":
         return True
     if session_id and n == session_id[:8].lower():
         return True
     if re.fullmatch(r"[0-9a-f]{6,12}", n):
         return True
+    # `<folder>-<hex>` for THIS session's folder — the derived shape, matched
+    # against the real cwd so a genuine rename like "phase-2b" is left alone.
+    base = _derived_name_base(n)
+    if base and cwd and cwd not in ("?", ""):
+        try:
+            folder = _sanitize_channel_name(Path(cwd).name)
+        except Exception:
+            folder = ""
+        if folder and base == folder:
+            return True
+    # Legacy special case: the home-folder placeholder (`user-xx`), which older
+    # registries wrote without a nameSource field.
     if re.fullmatch(r"user-[0-9a-z]{1,8}", n):
         return True
     return False
@@ -1168,7 +1207,7 @@ async def cmd_spawn(channel, user_id: int, query: str):
         await channel.send(f"No running Claude matches `{query}`.")
         return
 
-    channel_name = _channel_name_for(match.cwd, match.session_id, match.name)
+    channel_name = _channel_name_for(match.cwd, match.session_id, match.name, match.name_source)
     try:
         new_chan = await channel.guild.create_text_channel(
             name=channel_name,
@@ -2634,14 +2673,16 @@ async def _pid_watcher(interval: float = 15.0):
                         # when the session was /renamed OR the current name is a
                         # placeholder. Gated by a cooldown (Discord caps renames 2/10min).
                         if live:
-                            desired = _channel_name_for(live.cwd, live.session_id, live.name)
+                            desired = _channel_name_for(live.cwd, live.session_id, live.name, live.name_source)
                             chan = bot.get_channel(ch_id)
                             # A REAL /rename (not a placeholder) syncs the channel name;
                             # a placeholder CURRENT channel name (#user-a5, hex) gets healed.
                             # A placeholder registry name alone won't override a name the
                             # user set manually in Discord.
-                            real_rename = bool(live.name) and not _is_placeholder_name(live.name, live.session_id)
-                            heal = chan is not None and _is_placeholder_name(chan.name, live.session_id)
+                            real_rename = bool(live.name) and not _is_placeholder_name(
+                                live.name, live.session_id, live.cwd, live.name_source)
+                            heal = chan is not None and _is_placeholder_name(
+                                chan.name, live.session_id, live.cwd)
                             if ((real_rename or heal) and desired and chan is not None
                                     and chan.name != desired
                                     and _bot_deletable(chan)
@@ -2803,20 +2844,37 @@ async def _pid_watcher(interval: float = 15.0):
             print(f"  _pid_watcher error (continuing): {e}")
 
 
-async def _orphan_channel_sweeper(interval: float = 60.0):
-    """Background equivalent of `!cc sweep`: every minute, delete hex-id channels
-    whose 8-char prefix doesn't match a live claude.exe.
+# Channels younger than this are never swept: the reconciler / !cc spawn create the
+# channel first and attach a beat later, and a sweep mid-handshake would race them.
+STALE_CHANNEL_GRACE_SECONDS = 600
+# A channel must be judged stale on this many CONSECUTIVE passes before deletion,
+# so a transient blip (session registry mid-write, network drive remounting) can't
+# take out a healthy channel.
+STALE_CHANNEL_STRIKES = 2
+_stale_channel_strikes: Dict[int, int] = {}
 
-    Catches the orphans that slip past `_pid_watcher` because they were never
-    inserted into the `sessions` DB (auto-spawn watcher creates the Discord
-    channel but `cmd_attach` refused with "already attached elsewhere"). Without
-    this, hex-id orphans pile up forever in the sidebar.
-    """
-    hex_re = re.compile(r"^[0-9a-f]{8}$")
+
+async def _orphan_channel_sweeper(interval: float = 60.0):
+    """Every minute, delete STALE terminal channels — any bot-managed channel whose
+    session is neither open in a terminal (live pid) nor resumable from disk.
+
+    `_pid_watcher` only covers channels it's actively tracking; channels fall out of
+    tracking in known ways (auto-spawned channel whose attach was refused, bot killed
+    between create and attach, session JSONL/cwd deleted so boot-restore skips them).
+    Since the naming fix orphans carry HUMAN names (#piano, #claude-monitor), so the
+    old hex-name-only sweep never matched them and they piled up forever.
+
+    A channel is KEPT if any of: it's a control channel / not bot-managed; it's in
+    `attached_pids` (the pid watcher owns it — including its auto-resume flow); its DB
+    row has a live attached pid; its session_id is live under any pid (the reconciler
+    rebind owns it); its session is resumable on disk (auto-resume/boot-restore own
+    it); it's younger than the grace period. Everything else is stale and deleted
+    after STALE_CHANNEL_STRIKES consecutive stale passes."""
     while True:
         try:
             await asyncio.sleep(interval)
-            live_prefixes = {c.session_id[:8].lower() for c in list_running()}
+            running = list_running()
+            live_sids = {c.session_id for c in running if c.session_id}
 
             guilds_to_check = set()
             for cid in CONTROL_CHANNELS:
@@ -2824,29 +2882,67 @@ async def _orphan_channel_sweeper(interval: float = 60.0):
                 if ch and getattr(ch, "guild", None):
                     guilds_to_check.add(ch.guild)
 
+            seen_this_pass: set = set()
             for guild in guilds_to_check:
                 for ch in guild.text_channels:
-                    if ch.id in CONTROL_CHANNELS:
+                    if ch.id in CONTROL_CHANNELS or not _bot_deletable(ch):
                         continue
-                    if not hex_re.match(ch.name):
+                    seen_this_pass.add(ch.id)
+                    if ch.id in attached_pids:
+                        # Tracked live (or mid-auto-resume) — _pid_watcher owns it.
+                        _stale_channel_strikes.pop(ch.id, None)
                         continue
-                    if ch.name.lower() in live_prefixes:
+                    created = getattr(ch, "created_at", None)
+                    if created is not None and (
+                        (discord.utils.utcnow() - created).total_seconds()
+                        < STALE_CHANNEL_GRACE_SECONDS
+                    ):
+                        continue  # too young — may be mid create→attach handshake
+
+                    row = sessions.conn.execute(
+                        "SELECT session_id, cwd, attached_pid FROM sessions WHERE channel_id = ?",
+                        (ch.id,),
+                    ).fetchone()
+                    stale = True
+                    if row:
+                        sid, cwd, apid = row
+                        if apid and pid_alive(apid):
+                            stale = False  # live terminal, in-memory map just lagging
+                        elif sid and sid in live_sids:
+                            stale = False  # session live under another pid — rebind owns it
+                        elif (sid and cwd and cwd not in ("?", "")
+                              and Path(cwd).is_dir()
+                              and session_jsonl_path(cwd, sid).is_file()):
+                            stale = False  # resumable — auto-resume/boot-restore own it
+                    if not stale:
+                        _stale_channel_strikes.pop(ch.id, None)
+                        continue
+
+                    strikes = _stale_channel_strikes.get(ch.id, 0) + 1
+                    if strikes < STALE_CHANNEL_STRIKES:
+                        _stale_channel_strikes[ch.id] = strikes
                         continue
                     try:
                         await ch.delete(
-                            reason="cc-discord-remote: orphan hex-id channel auto-sweep"
+                            reason="cc-discord-remote: stale terminal channel "
+                                   "(no live or resumable session)"
                         )
                         sessions.conn.execute(
                             "DELETE FROM sessions WHERE channel_id = ?", (ch.id,)
                         )
                         ALLOWED_CHANNELS.discard(ch.id)
                         attached_pids.pop(ch.id, None)
+                        _stale_channel_strikes.pop(ch.id, None)
                         sessions.conn.commit()
-                        print(f"  auto-swept orphan channel #{ch.name}")
+                        print(f"  auto-swept stale channel #{ch.name} ({ch.id})")
                     except discord.Forbidden:
-                        pass
+                        pass  # keep strikes — retry when perms return
                     except discord.HTTPException as e:
                         print(f"  couldn't auto-sweep #{ch.name}: {e}")
+            # Drop strike entries for channels that vanished between passes.
+            for ch_id in list(_stale_channel_strikes):
+                if ch_id not in seen_this_pass:
+                    _stale_channel_strikes.pop(ch_id, None)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -2926,7 +3022,7 @@ async def _auto_spawn_watcher(interval: float = 15.0):
                         except Exception as e:
                             print(f"  reconcile: rebind failed for PID {c.pid}: {e}")
                         continue
-                    channel_name = _channel_name_for(c.cwd, c.session_id, c.name)
+                    channel_name = _channel_name_for(c.cwd, c.session_id, c.name, c.name_source)
                     try:
                         new_chan = await guild.create_text_channel(
                             name=channel_name, category=_terminal_category(guild),
@@ -3039,7 +3135,7 @@ async def _adopt_orphan_live_sessions():
             continue
         adopted_sids.add(c.session_id)
         _auto_spawn_seen.add(c.pid)  # keep the auto-spawn watcher from double-creating
-        channel_name = _channel_name_for(c.cwd, c.session_id, c.name)
+        channel_name = _channel_name_for(c.cwd, c.session_id, c.name, c.name_source)
         try:
             new_chan = await guild.create_text_channel(
                 name=channel_name, category=_terminal_category(guild)
@@ -3079,11 +3175,17 @@ async def _sweep_duplicate_terminal_channels():
     db_tracked = {r[0] for r in sessions.conn.execute("SELECT channel_id FROM sessions")}
     tracked = set(attached_pids.keys()) | db_tracked
 
+    # Group by the name with any per-launch `-<2hex>` suffix stripped, so Claude's
+    # derived names for one project ("claude-monitor-35", "claude-monitor-b9", …)
+    # collapse into the same bucket as the real "claude-monitor" channel. Grouping
+    # on the raw name alone never caught these — every relaunch produced a
+    # *uniquely* named channel, so they accumulated forever.
     by_name: Dict[str, list] = {}
     for chan in cat.channels:
         if getattr(chan, "type", None) is not None and not hasattr(chan, "send"):
             continue  # skip non-text (voice etc.)
-        by_name.setdefault(chan.name, []).append(chan)
+        key = _derived_name_base(chan.name) or chan.name
+        by_name.setdefault(key, []).append(chan)
 
     for name, chans in by_name.items():
         if len(chans) < 2:
@@ -3093,12 +3195,16 @@ async def _sweep_duplicate_terminal_channels():
         for c in chans:
             if c.id in tracked or c.id in CONTROL_CHANNELS:
                 continue
+            # Only remove an exact-name copy or a derived `<base>-<hex>` sibling —
+            # never a differently-named channel that merely shares a prefix.
+            if c.name != name and _derived_name_base(c.name) is None:
+                continue
             try:
                 await c.delete(reason="cc-discord-remote: duplicate orphan terminal channel")
                 ALLOWED_CHANNELS.discard(c.id)
-                print(f"  swept duplicate terminal channel #{name} ({c.id})")
+                print(f"  swept duplicate terminal channel #{c.name} ({c.id})")
             except Exception as e:
-                print(f"  couldn't sweep duplicate #{name} ({c.id}): {e}")
+                print(f"  couldn't sweep duplicate #{c.name} ({c.id}): {e}")
 
 
 async def _dedup_session_channels():
@@ -3605,9 +3711,36 @@ async def slash_cc(interaction: discord.Interaction, input: str):
     await dispatch(interaction.channel, interaction.channel_id, interaction.user.id, input)
 
 
+def _claim_single_instance():
+    """Refuse to start if another bot.py is already running.
+
+    Two live bots = two reconcilers racing to create channels for the same
+    session, which duplicates channels and posts every message twice. The
+    ensure-running.ps1 "is it running?" check is TOCTOU-racy (the task has both
+    a logon and a 5-minute trigger; when they fire in the same second both see
+    "not running" and both launch). A kernel named mutex is decided by the OS,
+    so exactly one process can ever hold it. Held for the process lifetime and
+    released automatically on exit/crash."""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    ERROR_ALREADY_EXISTS = 183
+    # "Local\" (per-logon-session), NOT "Global\": creating a Global object needs
+    # SeCreateGlobalPrivilege, so for a normal user the call fails and the guard
+    # silently does nothing. Both bots run as the same user, so Local is enough.
+    handle = ctypes.windll.kernel32.CreateMutexW(None, False, "Local\\cc-discord-remote-bot")
+    err = ctypes.windll.kernel32.GetLastError()
+    if handle and err == ERROR_ALREADY_EXISTS:
+        raise SystemExit("another cc-discord-remote bot.py is already running — exiting")
+    if not handle:
+        print(f"  WARNING: single-instance mutex unavailable (err {err}) — not guarding")
+    return handle  # keep a reference so the mutex lives as long as the process
+
+
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("DISCORD_TOKEN is empty. Fill it in .env before running.")
     if not ALLOWED_USERS:
         raise SystemExit("ALLOWED_USER_IDS is empty — refusing to start.")
+    _instance_lock = _claim_single_instance()
     bot.run(TOKEN)

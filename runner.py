@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 from typing import AsyncIterator, Awaitable, Callable, Optional, Tuple
 
 from claude_agent_sdk import (
@@ -41,6 +43,27 @@ async def _single_prompt_stream(text: str):
     yield {"type": "user", "message": {"role": "user", "content": text}}
 
 
+# Headless SDK queries are the high-frequency `claude` startups that were racing on
+# the global ~/.claude.json and corrupting it (forcing full relogins). Isolate ONLY
+# these to a dedicated config dir + long-lived OAuth token (single-use refresh tokens
+# can't be shared across concurrent queries). Interactive terminal tabs the bot spawns
+# deliberately do NOT get this — they must use the main config so `claude --resume`
+# can find session transcripts that live under ~/.claude.
+_BOT_CONFIG_DIR = r"C:\Users\User\.claude-bot"
+_BOT_TOKEN_FILE = Path(_BOT_CONFIG_DIR) / "oauth-token.txt"
+
+
+def _isolation_env() -> dict:
+    """Env overrides for the SDK subprocess. Empty (= inherit main config) until the
+    long-lived token is in place, so the bot never runs unauthenticated."""
+    if _BOT_TOKEN_FILE.is_file():
+        return {
+            "CLAUDE_CONFIG_DIR": _BOT_CONFIG_DIR,
+            "CLAUDE_CODE_OAUTH_TOKEN": _BOT_TOKEN_FILE.read_text(encoding="utf-8").strip(),
+        }
+    return {}
+
+
 async def run_turn(
     prompt: str,
     cwd: str,
@@ -58,6 +81,7 @@ async def run_turn(
         cwd=cwd,
         resume=resume_id,
         can_use_tool=_make_can_use_tool(on_approval),
+        env=_isolation_env(),
     )
 
     session_id: Optional[str] = None

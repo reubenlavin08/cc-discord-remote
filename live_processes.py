@@ -18,6 +18,12 @@ class LiveClaude:
     status: str
     name: Optional[str] = None
     started_at_ms: Optional[int] = None
+    # Claude Code sets nameSource="derived" when it auto-generated the name
+    # (e.g. "claude-monitor-35" = folder + 2 random hex) rather than the user
+    # running /rename. Derived names are per-launch placeholders and must never
+    # be used to name a channel — otherwise every restart invents a new unique
+    # channel name and duplicates pile up.
+    name_source: Optional[str] = None
 
 
 def pid_alive(pid: int) -> bool:
@@ -48,6 +54,7 @@ def list_running() -> List[LiveClaude]:
                 status=data.get("status", "?"),
                 name=data.get("name"),
                 started_at_ms=data.get("startedAt"),
+                name_source=data.get("nameSource"),
             )
         )
     out.sort(key=lambda c: c.started_at_ms or 0, reverse=True)
